@@ -1,0 +1,1018 @@
+//@version=6
+indicator('LVLS Algorithm', overlay = true, max_labels_count = 500, max_boxes_count = 1000, dynamic_requests = true)
+import TradingView/ta/12
+
+// Display and timeframe controls
+useCloseConfirmed = input.bool(true, 'Close-confirmed levels (use previous bar)', display = display.none)
+showOuter = input.bool(true, 'Show outer levels (Ext 1/2)', display = display.none)
+showLTF = input.bool(true, 'Show current timeframe layer', display = display.none)
+showHTF = input.bool(true, 'Show higher timeframe layer', display = display.none)
+htfTf = input.timeframe('240', 'Higher timeframe', display = display.none)
+
+// Lane controls
+laneLookback = input.int(24, 'Lane lookback (all lanes)', minval = 2, display = display.none)
+laneTf0 = input.timeframe('', 'Lane 1 timeframe', display = display.none)
+laneTf1 = input.timeframe('60', 'Lane 2 timeframe', display = display.none)
+laneTf2 = input.timeframe('240', 'Lane 3 timeframe', display = display.none)
+laneTf3 = input.timeframe('D', 'Lane 4 timeframe', display = display.none)
+
+// Lane offsets
+lane0 = 4 // input.int(4, 'Lane 1 offset')
+lane1 = 8 // input.int(8, 'Lane 2 offset')
+lane2 = 12 // input.int(12, 'Lane 3 offset')
+lane3 = 16 // input.int(16, 'Lane 4 offset')
+
+// Optional volume confirmation
+useVolumeConfirm = true // input.bool(false, 'Use volume-confirmed levels')
+volTouchAtrMult = 0.1 //input.float(0.15, 'Alignment touch tolerance (ATR multiple)', minval=0.01, step=0.01)
+volTouchTickMin = 1 //input.int(4, 'Alignment touch tolerance min ticks', minval=1)
+confirmLane = 17 //input.int(35, 'Volume confirmation lane offset')
+showVolZoneDebug = false // input.bool(false, 'Show internal vol zone bounds (debug)', display = display.none)
+showStateTable = input.bool(true, 'Show state table', display = display.none)
+stateTablePosition = input.string('Top Right', 'State table position', options = ['Top Right', 'Bottom Right'], display = display.none)
+stateLookbackMomentum = 24 //input.int(20, 'State momentum lookback', minval = 2, display = display.none)
+stateSmoothingLen = 5 //input.int(5, 'State smoothing length', minval = 1, display = display.none)
+stateDeadzone = 12 //input.int(12, 'State deadzone', minval = 0, maxval = 100, display = display.none)
+stateHoldMicro = input.int(3, 'State hold bars micro (5m)', minval = 1, maxval = 20, display = display.none)
+stateHoldMeso = input.int(3, 'State hold bars meso (1H)', minval = 1, maxval = 20, display = display.none)
+stateHoldMacro = input.int(3, 'State hold bars macro (1D)', minval = 1, maxval = 20, display = display.none)
+stateFastFlipDelta = input.int(28, 'State fast-flip delta', minval = 5, maxval = 100, display = display.none)
+showBiasDebugLines = input.bool(true, 'Show 3-line bias diagnostics', display = display.none)
+showStateHistory = input.bool(false, 'Show state history traces', display = display.none)
+stateHistorySource = input.string('Both', 'State history source', options = ['Both', 'Micro', 'Meso', 'Macro'], display = display.none)
+stateHistoryDetail = input.string('Compact', 'State history detail', options = ['Compact', 'Full'], display = display.none)
+stateHistoryLookback = input.int(200, 'State history anchor lookback', minval = 50, display = display.none)
+stateHistoryOffsetAtr = input.float(2.5, 'State history offset ATR', minval = 0.5, step = 0.25, display = display.none)
+stateHistoryAmpAtr = input.float(0.8, 'State history amplitude ATR', minval = 0.1, step = 0.1, display = display.none)
+stateHistoryGapAtr = input.float(1.2, 'State history panel gap ATR', minval = 0.2, step = 0.1, display = display.none)
+
+// Colors
+resCol = #c91b1b
+neuCol = color.rgb(16, 138, 203)
+supCol = color.rgb(15, 149, 20)
+
+// Labels
+o14 = '' //'Pivot 2'
+o13 = '' //'Pivot 1'
+o12 = '' //'R'
+o8 = '' //'N'
+o4 = '' //'S'
+o3 = '' //'Pivot 1'
+o2 = '' //'Pivot 2'
+
+// Constants
+logTen = math.log(10.0)
+log8 = math.log(8.0)
+log2 = math.log(2.0)
+EPS = 1e-10
+
+f_calcMurreyCore(_high, _low, _close, _lookback) =>
+    vLowRaw = (ta.lowest(_low, _lookback) + ta.lowest(_close, _lookback)) / 2.0
+    vHighRaw = (ta.highest(_high, _lookback) + ta.highest(_close, _lookback)) / 2.0
+    vLow = na(vLowRaw) ? _close : vLowRaw
+    vHigh = na(vHighRaw) ? _close : vHighRaw
+
+    vDist = vHigh - vLow
+    tmpHigh = vLow < 0 ? -vLow : vHigh
+    tmpLow = vLow < 0 ? -vLow - vDist : vLow
+    shift = vLow < 0
+
+    safeHigh = math.max(tmpHigh, EPS)
+    safeRange = math.max(tmpHigh - tmpLow, EPS)
+
+    sfVarBase = math.log(0.4 * safeHigh) / logTen
+    sfVar = sfVarBase - math.floor(sfVarBase)
+    srPow = math.floor(math.log(0.4 * safeHigh) / logTen)
+    srSmallPow = math.floor(math.log(0.005 * safeHigh) / log8)
+    SR = safeHigh > 25 ? sfVar > 0 ? math.exp(logTen * (srPow + 1)) : math.exp(logTen * srPow) : 100 * math.exp(log8 * srSmallPow)
+
+    nVar1 = math.log(math.max(SR / safeRange, EPS)) / log8
+    nVar2 = nVar1 - math.floor(nVar1)
+    N = nVar1 <= 0 ? 0 : nVar2 == 0 ? math.floor(nVar1) : math.floor(nVar1) + 1
+
+    SI = math.max(SR * math.exp(-N * log8), EPS)
+    ratio = math.max(safeRange / SI, EPS)
+    M = math.floor(1.0 / log2 * math.log(ratio) + 0.0000001)
+    base = SI * math.exp((M - 1) * log2)
+    safeBase = math.max(base, EPS)
+    I = math.round((tmpHigh + tmpLow) * 0.5 / safeBase)
+
+    bot = (I - 1) * safeBase
+    top = (I + 1) * safeBase
+
+    doShift = tmpHigh - top > 0.175 * (top - bot) or bot - tmpLow > 0.175 * (top - bot)
+    ER = doShift ? 1 : 0
+
+    MM = ER == 0 ? M : ER == 1 and M < 2 ? M + 1 : 0
+    NN = ER == 0 ? N : ER == 1 and M < 2 ? N : N - 1
+
+    finalSI = ER == 1 ? SR * math.exp(-NN * log8) : SI
+    finalBase = math.max(finalSI * math.exp((MM - 1) * log2), EPS)
+    finalI = ER == 1 ? math.round((tmpHigh + tmpLow) * 0.5 / finalBase) : I
+    finalBot = ER == 1 ? (finalI - 1) * finalBase : bot
+    finalTop = ER == 1 ? (finalI + 1) * finalBase : top
+
+    increment = (finalTop - finalBot) / 8.0
+    absTop = shift ? -(finalBot - 3.0 * increment) : finalTop + 3.0 * increment
+
+    plus28 = absTop - increment
+    plus18 = absTop - 2.0 * increment
+    eightEight = absTop - 3.0 * increment
+    fourEight = absTop - 7.0 * increment
+    zeroEight = absTop - 11.0 * increment
+    minus18 = absTop - 12.0 * increment
+    minus28 = absTop - 13.0 * increment
+
+    [plus28, plus18, eightEight, fourEight, zeroEight, minus18, minus28]
+
+f_calcMurrey(_high, _low, _close, _lookback) =>
+    f_calcMurreyCore(_high, _low, _close, _lookback)
+
+f_resolveTf(string _tf) =>
+    str.length(_tf) > 0 ? _tf : timeframe.period
+
+f_laneHlc(string _tf) =>
+    laneTf = f_resolveTf(_tf)
+    request.security(syminfo.tickerid, laneTf, [useCloseConfirmed ? high[1] : high, useCloseConfirmed ? low[1] : low, useCloseConfirmed ? close[1] : close], barmerge.gaps_off, barmerge.lookahead_off)
+
+f_laneMurrey(string _tf, int _lookback) =>
+    laneTf = f_resolveTf(_tf)
+    request.security(syminfo.tickerid, laneTf, f_calcMurrey(useCloseConfirmed ? high[1] : high, useCloseConfirmed ? low[1] : low, useCloseConfirmed ? close[1] : close, _lookback), barmerge.gaps_off, barmerge.lookahead_off)
+
+f_manageZones(array<float> _tops, array<float> _bots, array<int> _kinds, array<int> _breaks, array<int> _times, float _h, float _l, float _invClose, float _v, float _vEma, float _atr, int _zoneTime, float _volMult, int _maxZones, int _maxBreaks) =>
+    if array.size(_tops) > 0
+        for i = array.size(_tops) - 1 to 0 by 1
+            zTop = array.get(_tops, i)
+            zBot = array.get(_bots, i)
+            zKind = array.get(_kinds, i)
+            zBreaks = array.get(_breaks, i)
+            breakUp = zKind == -1 and _invClose > zTop
+            breakDn = zKind == 1 and _invClose < zBot
+            breakNeutral = zKind == 0 and (_invClose > zTop or _invClose < zBot)
+            flipped = breakUp or breakDn or breakNeutral
+            if flipped
+                nextKind = breakUp ? 1 : breakDn ? -1 : _invClose > zTop ? 1 : -1
+                zBreaks := zBreaks + 1
+                if zBreaks >= _maxBreaks
+                    array.remove(_tops, i)
+                    array.remove(_bots, i)
+                    array.remove(_kinds, i)
+                    array.remove(_breaks, i)
+                    array.remove(_times, i)
+                else
+                    array.set(_kinds, i, nextKind)
+                    array.set(_breaks, i, zBreaks)
+
+    r = _h - _l
+    atrPct = _atr > 0 ? r / _atr * 100.0 : 0.0
+    atrOk = atrPct <= 300.0
+    if _v > _vEma * _volMult and atrOk
+        pos = r > 0 ? (_invClose - _l) / r : 0.5
+        isBull = pos > 0.6
+        isBear = pos < 0.4
+        kind = isBull ? 1 : isBear ? -1 : 0
+        array.push(_tops, _h)
+        array.push(_bots, _l)
+        array.push(_kinds, kind)
+        array.push(_breaks, 0)
+        array.push(_times, _zoneTime)
+        if array.size(_tops) > _maxZones
+            array.shift(_tops)
+            array.shift(_bots)
+            array.shift(_kinds)
+            array.shift(_breaks)
+            array.shift(_times)
+
+f_pushUniquePrice(array<float> _rows, float _price, float _tol, int _maxRows) =>
+    bool isDup = false
+    if array.size(_rows) > 0
+        for i = 0 to array.size(_rows) - 1 by 1
+            if math.abs(array.get(_rows, i) - _price) <= _tol
+                isDup := true
+                isDup
+    if not isDup and array.size(_rows) < _maxRows
+        array.push(_rows, _price)
+
+f_hasNearPrice(array<float> _rows, float _price, float _tol) =>
+    bool found = false
+    if array.size(_rows) > 0
+        for i = 0 to array.size(_rows) - 1 by 1
+            if math.abs(array.get(_rows, i) - _price) <= _tol
+                found := true
+                found
+    found
+
+f_zoneAlignedRows(float _r0, float _n0, float _s0, float _r1, float _n1, float _s1, float _r2, float _n2, float _s2, float _r3, float _n3, float _s3, array<float> _tops, array<float> _bots, array<int> _kinds, float _tol, array<float> _longRows, array<float> _shortRows, array<float> _neutralRows, int _maxRows) =>
+    array.clear(_longRows)
+    array.clear(_shortRows)
+    array.clear(_neutralRows)
+
+    if array.size(_tops) > 0
+        for i = array.size(_tops) - 1 to 0 by 1
+            zTop = array.get(_tops, i)
+            zBot = array.get(_bots, i)
+            zKind = array.get(_kinds, i)
+
+            // Exclude neutral zones from volume confirmation matching.
+            if zKind == 0
+                continue
+
+            inR0 = _r0 <= zTop + _tol and _r0 >= zBot - _tol
+            inN0 = _n0 <= zTop + _tol and _n0 >= zBot - _tol
+            inS0 = _s0 <= zTop + _tol and _s0 >= zBot - _tol
+            inR1 = _r1 <= zTop + _tol and _r1 >= zBot - _tol
+            inN1 = _n1 <= zTop + _tol and _n1 >= zBot - _tol
+            inS1 = _s1 <= zTop + _tol and _s1 >= zBot - _tol
+            inR2 = _r2 <= zTop + _tol and _r2 >= zBot - _tol
+            inN2 = _n2 <= zTop + _tol and _n2 >= zBot - _tol
+            inS2 = _s2 <= zTop + _tol and _s2 >= zBot - _tol
+            inR3 = _r3 <= zTop + _tol and _r3 >= zBot - _tol
+            inN3 = _n3 <= zTop + _tol and _n3 >= zBot - _tol
+            inS3 = _s3 <= zTop + _tol and _s3 >= zBot - _tol
+            cntR = (inR0 ? 1 : 0) + (inR1 ? 1 : 0) + (inR2 ? 1 : 0) + (inR3 ? 1 : 0)
+            cntN = (inN0 ? 1 : 0) + (inN1 ? 1 : 0) + (inN2 ? 1 : 0) + (inN3 ? 1 : 0)
+            cntS = (inS0 ? 1 : 0) + (inS1 ? 1 : 0) + (inS2 ? 1 : 0) + (inS3 ? 1 : 0)
+
+            // Long row: for each lane pick S first, otherwise N. Need 2+ lanes clustered at one price.
+            longCnt = 0
+            longSum = 0.0
+            longMin = 1e20
+            longMax = -1e20
+            if inS0 or inN0
+                p0 = inS0 ? _s0 : _n0
+                longCnt := longCnt + 1
+                longSum := longSum + p0
+                longMin := math.min(longMin, p0)
+                longMax := math.max(longMax, p0)
+                longMax
+            if inS1 or inN1
+                p1 = inS1 ? _s1 : _n1
+                longCnt := longCnt + 1
+                longSum := longSum + p1
+                longMin := math.min(longMin, p1)
+                longMax := math.max(longMax, p1)
+                longMax
+            if inS2 or inN2
+                p2 = inS2 ? _s2 : _n2
+                longCnt := longCnt + 1
+                longSum := longSum + p2
+                longMin := math.min(longMin, p2)
+                longMax := math.max(longMax, p2)
+                longMax
+            if inS3 or inN3
+                p3 = inS3 ? _s3 : _n3
+                longCnt := longCnt + 1
+                longSum := longSum + p3
+                longMin := math.min(longMin, p3)
+                longMax := math.max(longMax, p3)
+                longMax
+            longOk = longCnt >= 2 and longMax - longMin <= _tol and cntS >= 1 and cntR == 0
+
+            // Short row: for each lane pick R first, otherwise N. Need 2+ lanes clustered at one price.
+            shortCnt = 0
+            shortSum = 0.0
+            shortMin = 1e20
+            shortMax = -1e20
+            if inR0 or inN0
+                p0 = inR0 ? _r0 : _n0
+                shortCnt := shortCnt + 1
+                shortSum := shortSum + p0
+                shortMin := math.min(shortMin, p0)
+                shortMax := math.max(shortMax, p0)
+                shortMax
+            if inR1 or inN1
+                p1 = inR1 ? _r1 : _n1
+                shortCnt := shortCnt + 1
+                shortSum := shortSum + p1
+                shortMin := math.min(shortMin, p1)
+                shortMax := math.max(shortMax, p1)
+                shortMax
+            if inR2 or inN2
+                p2 = inR2 ? _r2 : _n2
+                shortCnt := shortCnt + 1
+                shortSum := shortSum + p2
+                shortMin := math.min(shortMin, p2)
+                shortMax := math.max(shortMax, p2)
+                shortMax
+            if inR3 or inN3
+                p3 = inR3 ? _r3 : _n3
+                shortCnt := shortCnt + 1
+                shortSum := shortSum + p3
+                shortMin := math.min(shortMin, p3)
+                shortMax := math.max(shortMax, p3)
+                shortMax
+            shortOk = shortCnt >= 2 and shortMax - shortMin <= _tol and cntR >= 1 and cntS == 0
+
+            // Neutral row: 2+ N lanes clustered.
+            neutralCnt = 0
+            neutralSum = 0.0
+            neutralMin = 1e20
+            neutralMax = -1e20
+            if inN0
+                neutralCnt := neutralCnt + 1
+                neutralSum := neutralSum + _n0
+                neutralMin := math.min(neutralMin, _n0)
+                neutralMax := math.max(neutralMax, _n0)
+                neutralMax
+            if inN1
+                neutralCnt := neutralCnt + 1
+                neutralSum := neutralSum + _n1
+                neutralMin := math.min(neutralMin, _n1)
+                neutralMax := math.max(neutralMax, _n1)
+                neutralMax
+            if inN2
+                neutralCnt := neutralCnt + 1
+                neutralSum := neutralSum + _n2
+                neutralMin := math.min(neutralMin, _n2)
+                neutralMax := math.max(neutralMax, _n2)
+                neutralMax
+            if inN3
+                neutralCnt := neutralCnt + 1
+                neutralSum := neutralSum + _n3
+                neutralMin := math.min(neutralMin, _n3)
+                neutralMax := math.max(neutralMax, _n3)
+                neutralMax
+            neutralOk = neutralCnt >= 2 and neutralMax - neutralMin <= _tol and cntR == 0 and cntS == 0
+
+            if longOk
+                cand = longSum / longCnt
+                f_pushUniquePrice(_longRows, cand, _tol, _maxRows)
+            if shortOk
+                cand = shortSum / shortCnt
+                f_pushUniquePrice(_shortRows, cand, _tol, _maxRows)
+            if neutralOk
+                cand = neutralSum / neutralCnt
+                f_pushUniquePrice(_neutralRows, cand, _tol, _maxRows)
+
+f_clearLabels(array<label> _labels) =>
+    if array.size(_labels) > 0
+        for i = array.size(_labels) - 1 to 0 by 1
+            label.delete(array.get(_labels, i))
+            array.remove(_labels, i)
+
+f_plotVcLabels(array<float> _rows, string _txt, color _txtCol, int _xOffset, array<label> _labels) =>
+    if array.size(_rows) > 0
+        for i = 0 to array.size(_rows) - 1 by 1
+            y = array.get(_rows, i)
+            lbl = label.new(bar_index + _xOffset, y, _txt, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_label_left, color = color.new(_txtCol, 100), textcolor = _txtCol, size = size.small)
+            array.push(_labels, lbl)
+
+f_clearBoxes(array<box> _boxes) =>
+    if array.size(_boxes) > 0
+        for i = array.size(_boxes) - 1 to 0 by 1
+            box.delete(array.get(_boxes, i))
+            array.remove(_boxes, i)
+
+f_drawZoneBoxes(array<float> _tops, array<float> _bots, array<int> _times, color _bgCol, color _borderCol, array<box> _boxes) =>
+    if array.size(_tops) > 0
+        for i = 0 to array.size(_tops) - 1 by 1
+            zTop = array.get(_tops, i)
+            zBot = array.get(_bots, i)
+            zTime = array.get(_times, i)
+            b = box.new(zTime, zTop, time, zBot, xloc = xloc.bar_time, extend = extend.right, bgcolor = _bgCol, border_color = _borderCol)
+            array.push(_boxes, b)
+
+f_extConfirmedRows(float _u1, float _u2, float _d1, float _d2, array<float> _tops, array<float> _bots, array<int> _kinds, float _tol, array<float> _resRows, array<float> _supRows, int _maxRows) =>
+    if array.size(_tops) > 0
+        for i = array.size(_tops) - 1 to 0 by 1
+            zTop = array.get(_tops, i)
+            zBot = array.get(_bots, i)
+            zKind = array.get(_kinds, i)
+            if zKind == 0
+                continue
+
+            inU1 = _u1 <= zTop + _tol and _u1 >= zBot - _tol
+            inU2 = _u2 <= zTop + _tol and _u2 >= zBot - _tol
+            inD1 = _d1 <= zTop + _tol and _d1 >= zBot - _tol
+            inD2 = _d2 <= zTop + _tol and _d2 >= zBot - _tol
+
+            if inU1
+                f_pushUniquePrice(_resRows, _u1, _tol, _maxRows)
+            if inU2
+                f_pushUniquePrice(_resRows, _u2, _tol, _maxRows)
+            if inD1
+                f_pushUniquePrice(_supRows, _d1, _tol, _maxRows)
+            if inD2
+                f_pushUniquePrice(_supRows, _d2, _tol, _maxRows)
+
+f_sign(float _v) =>
+    _v > 0 ? 1.0 : _v < 0 ? -1.0 : 0.0
+
+f_clamp1(float _v) =>
+    math.max(-1.0, math.min(1.0, _v))
+
+f_laneMomentum(float _close, float _n, int _len) =>
+    upCnt = math.sum(_close > _n ? 1.0 : 0.0, _len)
+    dnCnt = math.sum(_close < _n ? 1.0 : 0.0, _len)
+    (upCnt - dnCnt) / _len
+
+f_laneBreakImpulse(float _high, float _low, float _r, float _s) =>
+    inc = (_r - _s) / 8.0
+    breakBuf = 0.125 * inc
+    breakUp = _high > _r + breakBuf
+    breakDn = _low < _s - breakBuf
+    breakUp and not breakDn ? 1.0 : breakDn and not breakUp ? -1.0 : 0.0
+
+f_laneTrend(float _high, float _low, float _close, float _r, float _n, float _s, int _momLen) =>
+    breakImpulse = f_laneBreakImpulse(_high, _low, _r, _s)
+    drift = _r > _r[1] and _s > _s[1] ? 1.0 : _r < _r[1] and _s < _s[1] ? -1.0 : 0.0
+    momOcc = f_laneMomentum(_close, _n, _momLen)
+    f_clamp1(0.55 * breakImpulse + 0.25 * drift + 0.20 * momOcc)
+
+f_signState(int _score, int _deadzone) =>
+    _score > _deadzone ? 1 : _score < -_deadzone ? -1 : 0
+
+f_signName(int _sign) =>
+    _sign > 0 ? 'Up' : _sign < 0 ? 'Down' : 'Neutral'
+
+f_signColor(int _sign) =>
+    _sign > 0 ? color.new(supCol, 0) : _sign < 0 ? color.new(resCol, 0) : color.new(neuCol, 0)
+    
+f_stateSummary(int _momLen, int _smoothLen) =>
+    [l0h, l0l, l0c] = f_laneHlc(laneTf0)
+    [l1h, l1l, l1c] = f_laneHlc(laneTf1)
+    [l2h, l2l, l2c] = f_laneHlc(laneTf2)
+    [l3h, l3l, l3c] = f_laneHlc(laneTf3)
+
+    [l0p28, l0p18, l0r, l0n, l0s, l0m18, l0m28] = f_laneMurrey(laneTf0, laneLookback)
+    [l1p28, l1p18, l1r, l1n, l1s, l1m18, l1m28] = f_laneMurrey(laneTf1, laneLookback)
+    [l2p28, l2p18, l2r, l2n, l2s, l2m18, l2m28] = f_laneMurrey(laneTf2, laneLookback)
+    [l3p28, l3p18, l3r, l3n, l3s, l3m18, l3m28] = f_laneMurrey(laneTf3, laneLookback)
+
+    l0Trend = f_laneTrend(l0h, l0l, l0c, l0r, l0n, l0s, _momLen)
+    l1Trend = f_laneTrend(l1h, l1l, l1c, l1r, l1n, l1s, _momLen)
+    l2Trend = f_laneTrend(l2h, l2l, l2c, l2r, l2n, l2s, _momLen)
+    l3Trend = f_laneTrend(l3h, l3l, l3c, l3r, l3n, l3s, _momLen)
+
+    l0Mom = f_laneMomentum(l0c, l0n, _momLen)
+    l1Mom = f_laneMomentum(l1c, l1n, _momLen)
+    l2Mom = f_laneMomentum(l2c, l2n, _momLen)
+    l3Mom = f_laneMomentum(l3c, l3n, _momLen)
+
+    // Hard-set lane-break weighting profile: lane0..lane3 = 0.45/0.30/0.17/0.08.
+    weightedTrendRaw = 0.45 * l0Trend + 0.30 * l1Trend + 0.17 * l2Trend + 0.08 * l3Trend
+    weightedMomRaw = 0.45 * l0Mom + 0.30 * l1Mom + 0.17 * l2Mom + 0.08 * l3Mom
+    trendSm = ta.ema(weightedTrendRaw, _smoothLen)
+    momSm = ta.ema(weightedMomRaw, _smoothLen)
+
+    trendSummaryScore = int(math.round(trendSm * 100.0))
+    momSummaryScore = int(math.round(momSm * 100.0))
+    lane0BreakSign = int(math.round(f_laneBreakImpulse(l0h, l0l, l0r, l0s)))
+    [trendSummaryScore, momSummaryScore, lane0BreakSign]
+
+f_stateSummaryStable(int _momLen, int _smoothLen, int _holdBars, int _fastFlipDelta) =>
+    [trendSummaryScore, momSummaryScore, lane0BreakSign] = f_stateSummary(_momLen, _smoothLen)
+    rawTrendSign = f_signState(trendSummaryScore, stateDeadzone)
+    rawMomSign = f_signState(momSummaryScore, stateDeadzone)
+
+    // Native-timeframe hysteresis state. Requires sign change to persist for N bars.
+    var int stableTrendSign = 0
+    var int stableMomSign = 0
+    var int trendCandidate = 0
+    var int momCandidate = 0
+    var int trendHoldCount = 0
+    var int momHoldCount = 0
+
+    trendDelta = math.abs(trendSummaryScore - nz(trendSummaryScore[1], trendSummaryScore))
+    momDelta = math.abs(momSummaryScore - nz(momSummaryScore[1], momSummaryScore))
+    fastTrendFlip = trendDelta >= _fastFlipDelta or (lane0BreakSign != 0 and rawTrendSign != 0 and lane0BreakSign == rawTrendSign)
+    fastMomFlip = momDelta >= _fastFlipDelta
+
+    if rawTrendSign != stableTrendSign
+        if fastTrendFlip
+            stableTrendSign := rawTrendSign
+            trendCandidate := rawTrendSign
+            trendHoldCount := 0
+        else
+            if trendCandidate != rawTrendSign
+                trendCandidate := rawTrendSign
+                trendHoldCount := 1
+            else
+                trendHoldCount := trendHoldCount + 1
+            if trendHoldCount >= _holdBars
+                stableTrendSign := rawTrendSign
+                trendHoldCount := 0
+    else
+        trendCandidate := rawTrendSign
+        trendHoldCount := 0
+
+    if rawMomSign != stableMomSign
+        if fastMomFlip
+            stableMomSign := rawMomSign
+            momCandidate := rawMomSign
+            momHoldCount := 0
+        else
+            if momCandidate != rawMomSign
+                momCandidate := rawMomSign
+                momHoldCount := 1
+            else
+                momHoldCount := momHoldCount + 1
+            if momHoldCount >= _holdBars
+                stableMomSign := rawMomSign
+                momHoldCount := 0
+    else
+        momCandidate := rawMomSign
+        momHoldCount := 0
+
+    [trendSummaryScore, momSummaryScore, lane0BreakSign, stableTrendSign, stableMomSign]
+
+f_stateName(int _score, int _deadzone) =>
+    _score > _deadzone ? 'Up' : _score < -_deadzone ? 'Down' : 'Neutral'
+
+f_stateColor(int _score, int _deadzone) =>
+    _score > _deadzone ? color.new(supCol, 0) : _score < -_deadzone ? color.new(resCol, 0) : color.new(neuCol, 0)
+
+f_biasDecisionColor(string _txt) =>
+    str.contains(_txt, 'no clear edge') ? color.new(neuCol, 0) : str.contains(_txt, 'buy') ? color.new(supCol, 0) : str.contains(_txt, 'sell') ? color.new(resCol, 0) : color.new(neuCol, 0)
+
+f_scoreToY(float _score, float _base, float _amp) =>
+    clamped = math.max(-100.0, math.min(100.0, _score))
+    _base + clamped / 100.0 * _amp
+
+f_stateText(int _score, int _deadzone) =>
+    prefix = _score > 0 ? '+' : ''
+    f_stateName(_score, _deadzone) + ' | ' + prefix + str.tostring(_score)
+
+f_strengthWord(int _score) =>
+    absScore = math.abs(_score)
+    absScore >= 55 ? 'strong' : absScore >= 28 ? 'moderate' : 'weak'
+
+f_tfNarrative(string _prefix, int _trendScore, int _momScore, int _deadzone) =>
+    tSign = f_signState(_trendScore, _deadzone)
+    mSign = f_signState(_momScore, _deadzone)
+    tStr = f_strengthWord(_trendScore)
+    _prefix + ' ' + (tSign > 0 ? tStr + ' uptrend ' + (mSign > 0 ? 'gaining momentum' : mSign < 0 ? 'losing momentum (bearish divergence)' : 'holding momentum') : tSign < 0 ? tStr + ' downtrend ' + (mSign < 0 ? 'gaining momentum' : mSign > 0 ? 'losing momentum (bullish divergence)' : 'holding momentum') : mSign > 0 ? 'trend neutral, bullish momentum building' : mSign < 0 ? 'trend neutral, bearish momentum building' : 'trend neutral, momentum flat')
+
+f_hierarchyAction(int _microT, int _microM, int _mesoT, int _mesoM, int _macroT, int _macroM, bool _regimeRisk, bool _isHighContext, bool _isLowerContext) =>
+    action = 'no clear edge, wait'
+    if _isLowerContext
+        // Sub-1H chart context: prioritize 5m/1H and broadly de-prioritize 1D for final action.
+        if _mesoT != 0
+            if _microT == _mesoT and (_microM == _mesoT or _microM == 0)
+                action := _mesoT > 0 ? 'look for buys on micro/meso continuation' : 'look for sells on micro/meso continuation'
+            else if _microT == -_mesoT
+                action := _mesoT > 0 ? 'micro pullback vs meso uptrend, wait then look for buys' : 'micro pullback vs meso downtrend, wait then look for sells'
+            else
+                action := _mesoT > 0 ? 'meso uptrend, wait for cleaner buy timing' : 'meso downtrend, wait for cleaner sell timing'
+        else
+            action := 'meso neutral, no clear edge, wait'
+    else if _isHighContext
+        // 4H+ context: 1D dominates, 5m/1H opposition is pullback unless regime-risk is active.
+        if _macroT != 0
+            if _regimeRisk
+                action := _macroT > 0 ? 'macro uptrend under regime-shift pressure, favor sells cautiously or wait' : 'macro downtrend under regime-shift pressure, favor buys cautiously or wait'
+            else if _mesoT == -_macroT or _microT == -_macroT
+                action := _macroT > 0 ? 'countertrend pullback vs macro uptrend, look for buys on confirmation' : 'countertrend rally vs macro downtrend, look for sells on confirmation'
+            else
+                action := _macroT > 0 ? 'macro uptrend intact, look for buys' : 'macro downtrend intact, look for sells'
+        else
+            action := _mesoT > 0 ? 'macro neutral, meso bullish, look for buys selectively' : _mesoT < 0 ? 'macro neutral, meso bearish, look for sells selectively' : 'no clear edge, wait'
+    else
+        // Mid context: balanced hierarchy interpretation.
+        if _regimeRisk
+            action := _macroT > 0 ? 'regime-risk against macro uptrend, favor sells or wait' : _macroT < 0 ? 'regime-risk against macro downtrend, favor buys or wait' : 'regime-risk, wait for confirmation'
+        else if _macroT != 0 and _mesoT == _macroT
+            if _microT == _macroT and _microM == _macroT
+                action := _macroT > 0 ? 'look for buys on continuation' : 'look for sells on continuation'
+            else if _microT == -_macroT
+                action := _macroT > 0 ? 'look for buys on pullbacks' : 'look for sells on rallies'
+            else
+                action := _macroT > 0 ? 'uptrend intact, wait for buy trigger' : 'downtrend intact, wait for sell trigger'
+        else if _macroT != 0 and _mesoT == -_macroT
+            action := _macroT > 0 ? 'meso pullback vs macro uptrend, look for buys cautiously' : 'meso pullback vs macro downtrend, look for sells cautiously'
+        else if _macroT == 0 and _mesoT != 0
+            action := _mesoT > 0 ? 'macro neutral, look for buys selectively' : 'macro neutral, look for sells selectively'
+    action
+
+[mp28_0, mp18_0, mr0, mn0, ms0, mm18_0, mm28_0] = f_laneMurrey(laneTf0, laneLookback)
+[mp28_1, mp18_1, mr1, mn1, ms1, mm18_1, mm28_1] = f_laneMurrey(laneTf1, laneLookback)
+[mp28_2, mp18_2, mr2, mn2, ms2, mm18_2, mm28_2] = f_laneMurrey(laneTf2, laneLookback)
+[mp28_3, mp18_3, mr3, mn3, ms3, mm18_3, mm28_3] = f_laneMurrey(laneTf3, laneLookback)
+
+[mhp28_0, mhp18_0, mhr0, mhn0, mhs0, mhm18_0, mhm28_0] = f_laneMurrey(laneTf0, laneLookback)
+[mhp28_1, mhp18_1, mhr1, mhn1, mhs1, mhm18_1, mhm28_1] = f_laneMurrey(laneTf1, laneLookback)
+[mhp28_2, mhp18_2, mhr2, mhn2, mhs2, mhm18_2, mhm28_2] = f_laneMurrey(laneTf2, laneLookback)
+[mhp28_3, mhp18_3, mhr3, mhn3, mhs3, mhm18_3, mhm28_3] = f_laneMurrey(laneTf3, laneLookback)
+
+vp28_0 = mp28_0
+vp18_0 = mp18_0
+vr0 = mr0
+vn0 = mn0
+vs0 = ms0
+vm18_0 = mm18_0
+vm28_0 = mm28_0
+vp28_1 = mp28_1
+vp18_1 = mp18_1
+vr1 = mr1
+vn1 = mn1
+vs1 = ms1
+vm18_1 = mm18_1
+vm28_1 = mm28_1
+vp28_2 = mp28_2
+vp18_2 = mp18_2
+vr2 = mr2
+vn2 = mn2
+vs2 = ms2
+vm18_2 = mm18_2
+vm28_2 = mm28_2
+vp28_3 = mp28_3
+vp18_3 = mp18_3
+vr3 = mr3
+vn3 = mn3
+vs3 = ms3
+vm18_3 = mm18_3
+vm28_3 = mm28_3
+vhp28_0 = mhp28_0
+vhp18_0 = mhp18_0
+vhr0 = mhr0
+vhn0 = mhn0
+vhs0 = mhs0
+vhm18_0 = mhm18_0
+vhm28_0 = mhm28_0
+vhp28_1 = mhp28_1
+vhp18_1 = mhp18_1
+vhr1 = mhr1
+vhn1 = mhn1
+vhs1 = mhs1
+vhm18_1 = mhm18_1
+vhm28_1 = mhm28_1
+vhp28_2 = mhp28_2
+vhp18_2 = mhp18_2
+vhr2 = mhr2
+vhn2 = mhn2
+vhs2 = mhs2
+vhm18_2 = mhm18_2
+vhm28_2 = mhm28_2
+vhp28_3 = mhp28_3
+vhp18_3 = mhp18_3
+vhr3 = mhr3
+vhn3 = mhn3
+vhs3 = mhs3
+vhm18_3 = mhm18_3
+vhm28_3 = mhm28_3
+
+stateTfMicro = '5'
+stateTfMeso = '60'
+stateTfMacro = 'D'
+stateCalcBars = 5000
+
+[microTrendScore, microMomScore, microLane0Break, microT, microM] = request.security(syminfo.tickerid, stateTfMicro, f_stateSummaryStable(stateLookbackMomentum, stateSmoothingLen, stateHoldMicro, stateFastFlipDelta), barmerge.gaps_off, barmerge.lookahead_off, calc_bars_count = stateCalcBars)
+[mesoTrendScore, mesoMomScore, mesoLane0Break, mesoT, mesoM] = request.security(syminfo.tickerid, stateTfMeso, f_stateSummaryStable(stateLookbackMomentum, stateSmoothingLen, stateHoldMeso, stateFastFlipDelta), barmerge.gaps_off, barmerge.lookahead_off, calc_bars_count = stateCalcBars)
+[macroTrendScore, macroMomScore, macroLane0Break, macroT, macroM] = request.security(syminfo.tickerid, stateTfMacro, f_stateSummaryStable(stateLookbackMomentum, stateSmoothingLen, stateHoldMacro, stateFastFlipDelta), barmerge.gaps_off, barmerge.lookahead_off, calc_bars_count = stateCalcBars)
+
+macroMomentumWeakening = math.abs(macroMomScore) < math.abs(macroMomScore[3])
+macroLane0OppBreak = macroT != 0 and macroLane0Break != 0 and macroLane0Break != macroT
+regimeRisk = mesoT != 0 and mesoT != macroT and (macroMomentumWeakening or macroLane0OppBreak)
+chartSecRaw = timeframe.in_seconds(timeframe.period)
+chartSec = nz(chartSecRaw, 0)
+isHighContext = chartSec >= timeframe.in_seconds('240')
+isLowerContext = chartSec > 0 and chartSec < timeframe.in_seconds('60')
+
+macroLine = 'Macro: ' + f_signName(macroT) + ' trend, ' + f_signName(macroM) + ' momentum'
+mesoContext = mesoT == 0 ? 'neutral vs macro' : mesoT == macroT ? 'continuation with macro' : regimeRisk ? 'regime-risk vs macro' : 'pullback vs macro'
+mesoLine = 'Meso: ' + mesoContext
+microContext = microT == 0 ? 'neutral timing' : mesoT != 0 and microT == -mesoT ? 'micro pullback vs meso' : macroT != 0 and microT == -macroT ? 'micro pullback vs macro' : mesoT != 0 and microT == mesoT ? 'timing aligned with meso' : 'mixed timing'
+microLine = 'Micro: ' + microContext
+actionLine = 'Action: ' + f_hierarchyAction(microT, microM, mesoT, mesoM, macroT, macroM, regimeRisk, isHighContext, isLowerContext)
+
+macroLineColor = f_signColor(macroT)
+mesoLineColor = f_signColor(mesoT)
+microLineColor = f_signColor(microT)
+actionLineColor = f_biasDecisionColor(actionLine)
+
+biasText = showBiasDebugLines ? macroLine + '\n' + mesoLine + '\n' + microLine + '\n' + actionLine : actionLine
+biasColor = actionLineColor
+
+// Optional on-chart state markers (stacked 5m/1H/1D regime icons).
+histAtr = ta.atr(100)
+histBase = ta.lowest(low, stateHistoryLookback) - histAtr * stateHistoryOffsetAtr
+showMicroHist = showStateHistory and (stateHistorySource == 'Both' or stateHistorySource == 'Micro')
+showMesoHist = showStateHistory and (stateHistorySource == 'Both' or stateHistorySource == 'Meso')
+showMacroHist = showStateHistory and (stateHistorySource == 'Both' or stateHistorySource == 'Macro')
+
+stackGap = math.max(histAtr * 0.35, syminfo.mintick * 4.0)
+stackBase = histBase - histAtr * stateHistoryGapAtr * 0.5
+macroY = stackBase
+mesoY = stackBase + stackGap
+microY = stackBase + stackGap * 2.0
+
+plotshape(showMacroHist and macroT > 0 ? macroY : na, 'Macro(1D) Up', shape.triangleup, location.bottom, color.new(supCol, 70), size = size.large)
+plotshape(showMacroHist and macroT < 0 ? macroY : na, 'Macro(1D) Down', shape.triangledown, location.bottom, color.new(resCol, 70), size = size.large)
+plotshape(showMacroHist and macroT == 0 ? macroY : na, 'Macro(1D) Neutral', shape.circle, location.bottom, color.new(neuCol, 70), size = size.large)
+
+plotshape(showMesoHist and mesoT > 0 ? mesoY : na, 'Meso(1H) Up', shape.triangleup, location.bottom, color.new(supCol, 40), size = size.normal)
+plotshape(showMesoHist and mesoT < 0 ? mesoY : na, 'Meso(1H) Down', shape.triangledown, location.bottom, color.new(resCol, 40), size = size.normal)
+plotshape(showMesoHist and mesoT == 0 ? mesoY : na, 'Meso(1H) Neutral', shape.circle, location.bottom, color.new(neuCol, 40), size = size.normal)
+
+plotshape(showMicroHist and microT > 0 ? microY : na, 'Micro(5m) Up', shape.triangleup, location.bottom, color.new(supCol, 10), size = size.small)
+plotshape(showMicroHist and microT < 0 ? microY : na, 'Micro(5m) Down', shape.triangledown, location.bottom, color.new(resCol, 10), size = size.small)
+plotshape(showMicroHist and microT == 0 ? microY : na, 'Micro(5m) Neutral', shape.circle, location.bottom, color.new(neuCol, 10), size = size.small)
+
+// Internal high-volume zones (no box plotting). Defaults hardcoded from zone script.
+zVolEmaLen = 20
+zVolMult = 2.0
+zAtrLen = 14
+zMaxZones = 100
+zMaxBreaks = 3
+
+ltfH = high
+ltfL = low
+ltfC = close
+ltfV = volume
+ltfVema = ta.ema(volume, zVolEmaLen)
+ltfAtr = ta.atr(zAtrLen)
+
+htfT = request.security(syminfo.tickerid, htfTf, time, barmerge.gaps_off, barmerge.lookahead_off)
+htfNewBar = ta.change(htfT) != 0
+htfVema = request.security(syminfo.tickerid, htfTf, ta.ema(volume, zVolEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfAtr = request.security(syminfo.tickerid, htfTf, ta.atr(zAtrLen), barmerge.gaps_off, barmerge.lookahead_off)
+htfPrevClose = request.security(syminfo.tickerid, htfTf, close[1], barmerge.gaps_off, barmerge.lookahead_off)
+htfZoneHigh = request.security(syminfo.tickerid, htfTf, high, barmerge.gaps_off, barmerge.lookahead_off)
+htfZoneLow = request.security(syminfo.tickerid, htfTf, low, barmerge.gaps_off, barmerge.lookahead_off)
+htfZoneVol = request.security(syminfo.tickerid, htfTf, volume, barmerge.gaps_off, barmerge.lookahead_off)
+
+var zLtfTop = array.new_float()
+var zLtfBot = array.new_float()
+var zLtfKind = array.new_int()
+var zLtfBreaks = array.new_int()
+var zLtfTime = array.new_int()
+var zHtfTop = array.new_float()
+var zHtfBot = array.new_float()
+var zHtfKind = array.new_int()
+var zHtfBreaks = array.new_int()
+var zHtfTime = array.new_int()
+var dbgZoneBoxes = array.new<box>()
+
+f_manageZones(zLtfTop, zLtfBot, zLtfKind, zLtfBreaks, zLtfTime, ltfH, ltfL, ltfC, ltfV, ltfVema, ltfAtr, time, zVolMult, zMaxZones, zMaxBreaks)
+if htfNewBar
+    f_manageZones(zHtfTop, zHtfBot, zHtfKind, zHtfBreaks, zHtfTime, htfZoneHigh, htfZoneLow, htfPrevClose, htfZoneVol, htfVema, htfAtr, htfT, zVolMult, zMaxZones, zMaxBreaks)
+
+alignTolLtf = math.max(ltfAtr * volTouchAtrMult, syminfo.mintick * volTouchTickMin)
+alignTolHtf = math.max(htfAtr * volTouchAtrMult, syminfo.mintick * volTouchTickMin)
+maxConfirmedRows = 24
+bothTol = math.max(alignTolLtf, alignTolHtf)
+
+var ltfLongRows = array.new_float()
+var ltfShortRows = array.new_float()
+var ltfNeutralRows = array.new_float()
+var htfLongRows = array.new_float()
+var htfShortRows = array.new_float()
+var htfNeutralRows = array.new_float()
+var ltfLongOwnRows = array.new_float()
+var ltfShortOwnRows = array.new_float()
+var ltfNeutralOwnRows = array.new_float()
+var ltfLongCrossRows = array.new_float()
+var ltfShortCrossRows = array.new_float()
+var ltfNeutralCrossRows = array.new_float()
+var htfLongOwnRows = array.new_float()
+var htfShortOwnRows = array.new_float()
+var htfNeutralOwnRows = array.new_float()
+var htfLongCrossRows = array.new_float()
+var htfShortCrossRows = array.new_float()
+var htfNeutralCrossRows = array.new_float()
+var extLongRows = array.new_float()
+var extShortRows = array.new_float()
+var allLongRows = array.new_float()
+var allShortRows = array.new_float()
+var allNeutralRows = array.new_float()
+var vcLabels = array.new<label>()
+
+f_zoneAlignedRows(vr0, vn0, vs0, vr1, vn1, vs1, vr2, vn2, vs2, vr3, vn3, vs3, zLtfTop, zLtfBot, zLtfKind, alignTolLtf, ltfLongOwnRows, ltfShortOwnRows, ltfNeutralOwnRows, maxConfirmedRows)
+if showHTF
+    f_zoneAlignedRows(vr0, vn0, vs0, vr1, vn1, vs1, vr2, vn2, vs2, vr3, vn3, vs3, zHtfTop, zHtfBot, zHtfKind, alignTolLtf, ltfLongCrossRows, ltfShortCrossRows, ltfNeutralCrossRows, maxConfirmedRows)
+    f_zoneAlignedRows(vhr0, vhn0, vhs0, vhr1, vhn1, vhs1, vhr2, vhn2, vhs2, vhr3, vhn3, vhs3, zHtfTop, zHtfBot, zHtfKind, alignTolHtf, htfLongOwnRows, htfShortOwnRows, htfNeutralOwnRows, maxConfirmedRows)
+    f_zoneAlignedRows(vhr0, vhn0, vhs0, vhr1, vhn1, vhs1, vhr2, vhn2, vhs2, vhr3, vhn3, vhs3, zLtfTop, zLtfBot, zLtfKind, alignTolHtf, htfLongCrossRows, htfShortCrossRows, htfNeutralCrossRows, maxConfirmedRows)
+else
+    array.clear(ltfLongCrossRows)
+    array.clear(ltfShortCrossRows)
+    array.clear(ltfNeutralCrossRows)
+    array.clear(htfLongOwnRows)
+    array.clear(htfShortOwnRows)
+    array.clear(htfNeutralOwnRows)
+    array.clear(htfLongCrossRows)
+    array.clear(htfShortCrossRows)
+    array.clear(htfNeutralCrossRows)
+
+array.clear(extLongRows)
+array.clear(extShortRows)
+f_extConfirmedRows(vp18_0, vp28_0, vm18_0, vm28_0, zLtfTop, zLtfBot, zLtfKind, alignTolLtf, extShortRows, extLongRows, maxConfirmedRows)
+if showHTF
+    f_extConfirmedRows(vp18_0, vp28_0, vm18_0, vm28_0, zHtfTop, zHtfBot, zHtfKind, alignTolLtf, extShortRows, extLongRows, maxConfirmedRows)
+
+array.clear(ltfLongRows)
+array.clear(ltfShortRows)
+array.clear(ltfNeutralRows)
+array.clear(htfLongRows)
+array.clear(htfShortRows)
+array.clear(htfNeutralRows)
+mergeTol = math.max(alignTolLtf, alignTolHtf)
+
+if array.size(ltfLongOwnRows) > 0
+    for i = 0 to array.size(ltfLongOwnRows) - 1 by 1
+        f_pushUniquePrice(ltfLongRows, array.get(ltfLongOwnRows, i), mergeTol, maxConfirmedRows)
+if array.size(ltfLongCrossRows) > 0
+    for i = 0 to array.size(ltfLongCrossRows) - 1 by 1
+        f_pushUniquePrice(ltfLongRows, array.get(ltfLongCrossRows, i), mergeTol, maxConfirmedRows)
+if array.size(ltfShortOwnRows) > 0
+    for i = 0 to array.size(ltfShortOwnRows) - 1 by 1
+        f_pushUniquePrice(ltfShortRows, array.get(ltfShortOwnRows, i), mergeTol, maxConfirmedRows)
+if array.size(ltfShortCrossRows) > 0
+    for i = 0 to array.size(ltfShortCrossRows) - 1 by 1
+        f_pushUniquePrice(ltfShortRows, array.get(ltfShortCrossRows, i), mergeTol, maxConfirmedRows)
+if array.size(ltfNeutralOwnRows) > 0
+    for i = 0 to array.size(ltfNeutralOwnRows) - 1 by 1
+        f_pushUniquePrice(ltfNeutralRows, array.get(ltfNeutralOwnRows, i), mergeTol, maxConfirmedRows)
+if array.size(ltfNeutralCrossRows) > 0
+    for i = 0 to array.size(ltfNeutralCrossRows) - 1 by 1
+        f_pushUniquePrice(ltfNeutralRows, array.get(ltfNeutralCrossRows, i), mergeTol, maxConfirmedRows)
+
+if showHTF
+    if array.size(htfLongOwnRows) > 0
+        for i = 0 to array.size(htfLongOwnRows) - 1 by 1
+            f_pushUniquePrice(htfLongRows, array.get(htfLongOwnRows, i), mergeTol, maxConfirmedRows)
+    if array.size(htfLongCrossRows) > 0
+        for i = 0 to array.size(htfLongCrossRows) - 1 by 1
+            f_pushUniquePrice(htfLongRows, array.get(htfLongCrossRows, i), mergeTol, maxConfirmedRows)
+    if array.size(htfShortOwnRows) > 0
+        for i = 0 to array.size(htfShortOwnRows) - 1 by 1
+            f_pushUniquePrice(htfShortRows, array.get(htfShortOwnRows, i), mergeTol, maxConfirmedRows)
+    if array.size(htfShortCrossRows) > 0
+        for i = 0 to array.size(htfShortCrossRows) - 1 by 1
+            f_pushUniquePrice(htfShortRows, array.get(htfShortCrossRows, i), mergeTol, maxConfirmedRows)
+    if array.size(htfNeutralOwnRows) > 0
+        for i = 0 to array.size(htfNeutralOwnRows) - 1 by 1
+            f_pushUniquePrice(htfNeutralRows, array.get(htfNeutralOwnRows, i), mergeTol, maxConfirmedRows)
+    if array.size(htfNeutralCrossRows) > 0
+        for i = 0 to array.size(htfNeutralCrossRows) - 1 by 1
+            f_pushUniquePrice(htfNeutralRows, array.get(htfNeutralCrossRows, i), mergeTol, maxConfirmedRows)
+
+array.clear(allLongRows)
+array.clear(allShortRows)
+array.clear(allNeutralRows)
+
+if useVolumeConfirm
+    if array.size(ltfLongRows) > 0
+        for i = 0 to array.size(ltfLongRows) - 1 by 1
+            p = array.get(ltfLongRows, i)
+            f_pushUniquePrice(allLongRows, p, bothTol, maxConfirmedRows)
+
+    if showHTF and array.size(htfLongRows) > 0
+        for i = 0 to array.size(htfLongRows) - 1 by 1
+            p = array.get(htfLongRows, i)
+            f_pushUniquePrice(allLongRows, p, bothTol, maxConfirmedRows)
+
+    if array.size(ltfShortRows) > 0
+        for i = 0 to array.size(ltfShortRows) - 1 by 1
+            p = array.get(ltfShortRows, i)
+            f_pushUniquePrice(allShortRows, p, bothTol, maxConfirmedRows)
+
+    if showHTF and array.size(htfShortRows) > 0
+        for i = 0 to array.size(htfShortRows) - 1 by 1
+            p = array.get(htfShortRows, i)
+            f_pushUniquePrice(allShortRows, p, bothTol, maxConfirmedRows)
+
+    if array.size(extLongRows) > 0
+        for i = 0 to array.size(extLongRows) - 1 by 1
+            p = array.get(extLongRows, i)
+            f_pushUniquePrice(allLongRows, p, bothTol, maxConfirmedRows)
+
+    if array.size(extShortRows) > 0
+        for i = 0 to array.size(extShortRows) - 1 by 1
+            p = array.get(extShortRows, i)
+            f_pushUniquePrice(allShortRows, p, bothTol, maxConfirmedRows)
+
+    if array.size(ltfNeutralRows) > 0
+        for i = 0 to array.size(ltfNeutralRows) - 1 by 1
+            p = array.get(ltfNeutralRows, i)
+            if not f_hasNearPrice(allLongRows, p, bothTol) and not f_hasNearPrice(allShortRows, p, bothTol)
+                f_pushUniquePrice(allNeutralRows, p, bothTol, maxConfirmedRows)
+
+    if showHTF and array.size(htfNeutralRows) > 0
+        for i = 0 to array.size(htfNeutralRows) - 1 by 1
+            p = array.get(htfNeutralRows, i)
+            if not f_hasNearPrice(allLongRows, p, bothTol) and not f_hasNearPrice(allShortRows, p, bothTol)
+                f_pushUniquePrice(allNeutralRows, p, bothTol, maxConfirmedRows)
+
+plotLtfOuter = showLTF and showOuter
+plotLtfCore = showLTF
+plotHtfOuter = showHTF and showOuter
+plotHtfCore = showHTF
+plotNeutral = true
+
+htfRes = color.new(resCol, 65)
+htfNeu = color.new(neuCol, 65)
+htfSup = color.new(supCol, 65)
+lane0IncGhostCol = color.new(color.rgb(128, 128, 128), 50)
+htfLane0Inc = (vhr0 - vhs0) / 8.0
+htfLane0_1_8 = vhs0 + htfLane0Inc
+htfLane0_2_8 = vhs0 + htfLane0Inc * 2.0
+htfLane0_3_8 = vhs0 + htfLane0Inc * 3.0
+htfLane0_5_8 = vhs0 + htfLane0Inc * 5.0
+htfLane0_6_8 = vhs0 + htfLane0Inc * 6.0
+htfLane0_7_8 = vhs0 + htfLane0Inc * 7.0
+ltfLane0Inc = (vr0 - vs0) / 8.0
+ltfLane0_1_8 = vs0 + ltfLane0Inc
+ltfLane0_2_8 = vs0 + ltfLane0Inc * 2.0
+ltfLane0_3_8 = vs0 + ltfLane0Inc * 3.0
+ltfLane0_5_8 = vs0 + ltfLane0Inc * 5.0
+ltfLane0_6_8 = vs0 + ltfLane0Inc * 6.0
+ltfLane0_7_8 = vs0 + ltfLane0Inc * 7.0
+
+// Draw HTF first so LTF stays visually on top.
+plotshape(plotHtfOuter ? vhp28_0 : na, o14, shape.triangledown, location.absolute, htfRes, lane0, '', htfRes, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfOuter ? vhp18_0 : na, o13, shape.triangledown, location.absolute, htfRes, lane0, '', htfRes, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? vhr0 : na, o12, shape.circle, location.absolute, htfRes, lane0, '', htfRes, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore and plotNeutral ? vhn0 : na, o8, shape.circle, location.absolute, htfNeu, lane0, '', htfNeu, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? vhs0 : na, o4, shape.circle, location.absolute, htfSup, lane0, '', htfSup, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfOuter ? vhm18_0 : na, o3, shape.triangleup, location.absolute, htfSup, lane0, '', htfSup, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfOuter ? vhm28_0 : na, o2, shape.triangleup, location.absolute, htfSup, lane0, '', htfSup, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? htfLane0_1_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? htfLane0_2_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? htfLane0_3_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? htfLane0_5_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? htfLane0_6_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? htfLane0_7_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+
+plotshape(plotHtfCore ? vhr1 : na, o12, shape.circle, location.absolute, htfRes, lane1, '', htfRes, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore and plotNeutral ? vhn1 : na, o8, shape.circle, location.absolute, htfNeu, lane1, '', htfNeu, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? vhs1 : na, o4, shape.circle, location.absolute, htfSup, lane1, '', htfSup, true, size.small, show_last = 1, display = display.all - display.status_line)
+
+plotshape(plotHtfCore ? vhr2 : na, o12, shape.circle, location.absolute, htfRes, lane2, '', htfRes, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore and plotNeutral ? vhn2 : na, o8, shape.circle, location.absolute, htfNeu, lane2, '', htfNeu, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? vhs2 : na, o4, shape.circle, location.absolute, htfSup, lane2, '', htfSup, true, size.small, show_last = 1, display = display.all - display.status_line)
+
+plotshape(plotHtfCore ? vhr3 : na, o12, shape.circle, location.absolute, htfRes, lane3, '', htfRes, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore and plotNeutral ? vhn3 : na, o8, shape.circle, location.absolute, htfNeu, lane3, '', htfNeu, true, size.small, show_last = 1, display = display.all - display.status_line)
+plotshape(plotHtfCore ? vhs3 : na, o4, shape.circle, location.absolute, htfSup, lane3, '', htfSup, true, size.small, show_last = 1, display = display.all - display.status_line)
+
+
+// Draw LTF after HTF so LTF labels and colors remain dominant.
+plotshape(plotLtfOuter ? vp28_0 : na, o14, shape.triangledown, location.absolute, color.new(resCol, 0), lane0, o14, color.new(resCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfOuter ? vp18_0 : na, o13, shape.triangledown, location.absolute, color.new(resCol, 0), lane0, o13, color.new(resCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? vr0 : na, o12, shape.xcross, location.absolute, color.new(resCol, 0), lane0, o12, color.new(resCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore and plotNeutral ? vn0 : na, o8, shape.xcross, location.absolute, color.new(neuCol, 0), lane0, o8, color.new(neuCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? vs0 : na, o4, shape.xcross, location.absolute, color.new(supCol, 0), lane0, o4, color.new(supCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfOuter ? vm18_0 : na, o3, shape.triangleup, location.absolute, color.new(supCol, 0), lane0, o3, color.new(supCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfOuter ? vm28_0 : na, o2, shape.triangleup, location.absolute, color.new(supCol, 0), lane0, o2, color.new(supCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? ltfLane0_1_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? ltfLane0_2_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? ltfLane0_3_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? ltfLane0_5_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? ltfLane0_6_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? ltfLane0_7_8 : na, '', shape.circle, location.absolute, lane0IncGhostCol, lane0, '', lane0IncGhostCol, true, size.tiny, show_last = 1, display = display.all - display.status_line)
+
+plotshape(plotLtfCore ? vr1 : na, o12, shape.xcross, location.absolute, color.new(resCol, 0), lane1, o12, color.new(resCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore and plotNeutral ? vn1 : na, o8, shape.xcross, location.absolute, color.new(neuCol, 0), lane1, o8, color.new(neuCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? vs1 : na, o4, shape.xcross, location.absolute, color.new(supCol, 0), lane1, o4, color.new(supCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+
+plotshape(plotLtfCore ? vr2 : na, o12, shape.xcross, location.absolute, color.new(resCol, 0), lane2, o12, color.new(resCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore and plotNeutral ? vn2 : na, o8, shape.xcross, location.absolute, color.new(neuCol, 0), lane2, o8, color.new(neuCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? vs2 : na, o4, shape.xcross, location.absolute, color.new(supCol, 0), lane2, o4, color.new(supCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+
+plotshape(plotLtfCore ? vr3 : na, o12, shape.xcross, location.absolute, color.new(resCol, 0), lane3, o12, color.new(resCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore and plotNeutral ? vn3 : na, o8, shape.xcross, location.absolute, color.new(neuCol, 0), lane3, o8, color.new(neuCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+plotshape(plotLtfCore ? vs3 : na, o4, shape.xcross, location.absolute, color.new(supCol, 0), lane3, o4, color.new(supCol, 0), true, size.tiny, show_last = 1, display = display.all - display.status_line)
+
+
+// Debug: internal active vol-zones drawn as discrete boxes.
+f_clearBoxes(dbgZoneBoxes)
+if showVolZoneDebug
+    f_drawZoneBoxes(zHtfTop, zHtfBot, zHtfTime, color.new(color.blue, 88), color.new(color.blue, 70), dbgZoneBoxes)
+    f_drawZoneBoxes(zLtfTop, zLtfBot, zLtfTime, color.new(color.green, 88), color.new(color.green, 70), dbgZoneBoxes)
+
+// Volume-confirmed row labels.
+f_clearLabels(vcLabels)
+if useVolumeConfirm
+    f_plotVcLabels(allLongRows, 'High Volume', color.new(supCol, 0), confirmLane, vcLabels)
+    f_plotVcLabels(allShortRows, 'High Volume', color.new(resCol, 0), confirmLane, vcLabels)
+    if plotNeutral
+        f_plotVcLabels(allNeutralRows, 'High Volume', color.new(neuCol, 0), confirmLane, vcLabels)
+
+// State table (Trend + Momentum by term, Current vs HTF).
+var table stateTbl = na
+var string prevTblPos = ''
+tblPos = stateTablePosition == 'Bottom Right' ? position.bottom_right : position.top_right
+
+if na(stateTbl) or prevTblPos != stateTablePosition
+    if not na(stateTbl)
+        table.delete(stateTbl)
+    stateTbl := table.new(tblPos, 1, 4, border_width = 0)
+    prevTblPos := stateTablePosition
+
+if barstate.islast
+    if showStateTable
+        if showBiasDebugLines
+            table.cell(stateTbl, 0, 0, macroLine, text_color = macroLineColor, bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_right)
+            table.cell(stateTbl, 0, 1, mesoLine, text_color = mesoLineColor, bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_right)
+            table.cell(stateTbl, 0, 2, microLine, text_color = microLineColor, bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_right)
+            table.cell(stateTbl, 0, 3, actionLine, text_color = actionLineColor, bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_right)
+        else
+            table.cell(stateTbl, 0, 0, actionLine, text_color = actionLineColor, bgcolor = color.new(color.black, 85), text_size = size.tiny, text_halign = text.align_right)
+            table.cell(stateTbl, 0, 1, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
+            table.cell(stateTbl, 0, 2, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
+            table.cell(stateTbl, 0, 3, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
+    else
+        table.cell(stateTbl, 0, 0, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
+        table.cell(stateTbl, 0, 1, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
+        table.cell(stateTbl, 0, 2, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
+        table.cell(stateTbl, 0, 3, '', text_color = color.new(color.white, 100), bgcolor = color.new(color.black, 100), text_size = size.tiny, text_halign = text.align_right)
