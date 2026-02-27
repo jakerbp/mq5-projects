@@ -79,12 +79,10 @@ struct ActivePair
   {
    string            symbolA;
    string            symbolB;
-   double            correlation;
    double            score;            // scanner ranking score (mode-dependent)
    bool              active;
    bool              tradingEnabled;  // false if pair dropped out but has open trades
    bool              recoveryManagedOnly; // true only for managed-only recovery slots
-   double            zScore;
    // Murrey levels (live, recalculated every bar)
    double            mm_88, mm_48, mm_08, mmIncrement, mmIncrementB;
    double            mm_plus28, mm_plus18, mm_minus18, mm_minus28;
@@ -139,21 +137,30 @@ struct TickPositionRow
 #include "Sniper_Strategy.mqh"
 input group "~~~~~~~~~General Settings~~~~~~~~~";
 input long    MAGIC_NUMBER = 20250215;             // Magic Number
-input bool    EnableLogging = true;                 // Enable Logging
-input double  MaxSpreadPips = 3.0;                  // Max Spread (pips, 0=off)
+input group "#### Scanner & Symbol Selection ####";
+input string  Trade_Symbols = "EURUSD,GBPUSD,AUDUSD,NZDUSD,USDJPY,USDCAD,USDCHF,EURJPY,GBPJPY,EURGBP"; // Symbols
+input int     Max_Pairs = 3;                        // Max Active Pairs
+input int     Scanner_IntervalHours = 4;            // Rescan Interval (hours)
+input bool    UseCurrencyStrengthMatrix = false;    // Use Currency Strength Matrix
+input enumTf  StrengthTimeframe = tfD1;             // Strength Timeframe
+input int     StrengthLookbackBars = 5;             // Strength Lookback (bars on StrengthTimeframe)
+input int     StrengthExtremeCount = 1;             // Strongest/Weakest Buckets (1-2)
+input ENUM_DECISION_MODE DecisionMode = decisionLegacyParity; // Legacy parity or ranked deterministic
+input ENUM_STRATEGY_TIEBREAK StrategyTieBreak = stratTrendFirst; // Strategy priority when capped
+input ENUM_SIDE_TIEBREAK SideTieBreak = sideBuyFirst; // Side priority when capped
+input int     MaxStartsPerBar = 0;                   // Max sequence starts per bar (0=off)
+input int     MaxAddsPerBar = 0;                     // Max grid adds per bar (0=off)
 
-//+------------------------------------------------------------------+
-//|  INPUTS - MEAN REVERSION STRATEGY                                |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Mean Reversion Strategy~~~~~~~~~";
+input group "#### Mean Reversion Strategy ####";
 input bool    EnableMeanReversion = true;           // Enable Mean Reversion
 input bool    AllowNewMeanReversionSequences = true; // Allow New MR Sequences
 input enumMarkovMode MeanReversionMarkovMode = markovModeOff; // MR Markov Mode (Off/Directional/Trending/Ranging)
 input enumTf  MrMM_Timeframe = tfH1;                // MR Murrey Timeframe
+input int     MrMM_Lookback = 96;                  // MR Murrey Lookback
+input int     EntryMmLevel = 8;                     // MR Entry MM Level for Sell (-2..10, Buy mirrors as 8-level)
 input enumRangeMetric MrRangeMetric = rangeAtr;     // MR Dynamic Range Source
 input double  MrMinIncrementBlock_Pips = 0;         // MR Min Increment to Block (0=off, neg=ATR/Keltner mult)
 input double  MrMinIncrementExpand_Pips = 0;        // MR Min Increment to Expand (0=off, neg=ATR/Keltner mult)
-input bool    AllowNewSequence = true;              // Global gate for opening brand-new sequences
 input string  MrSessionStartTime = "00:00";         // MR Session Start
 input string  MrSessionEndTime = "23:59";           // MR Session End
 input ENUM_SESSION_END MrSessionEndAction = NO_TRADES_FOR_NEW_CYCLE; // MR End Action
@@ -161,8 +168,13 @@ input double  MrLotSize = 0.01;                     // MR Base Lot Size
 input double  MrLotMultiplier = 1.0;                // MR Lot Multiplier
 input double  MrMaxLots = 1.0;                      // MR Max Lots Per Order
 input double  MrRiskPercent = 0;                    // MR Risk % (0=use MrLotSize)
+input double  LockProfitTriggerPips = 0;            // MR Lock Profit Trigger (pips, neg=ATR/Keltner mult)
+input double  TrailingStop = 5.0;                   // MR Trailing Stop (pips, neg=ATR/Keltner mult)
+input int     LockProfitMinTrades = 0;              // MR Min Trades for Lock Profit
+input enumTrailFrequency LockProfitCheckFrequency = trailEveryTick; // MR Lock Trigger Check Frequency
+input enumTrailFrequency TrailFrequency = trailEveryTick; // MR Trailing SL Update Frequency
 
-input group "~~~~~~~~~Trending Strategy~~~~~~~~~";
+input group "#### Trending Strategy ####";
 input bool    EnableTrendingStrategy = false;       // Enable Trending Strategy
 input bool    AllowNewTrendingSequences = true;     // Allow New Trending Sequences
 input enumMarkovMode TrendingMarkovMode = markovModeOff; // Trend Markov Mode (Off/Directional/Trending/Ranging)
@@ -170,6 +182,7 @@ input enumTrendEntryType TrendEntryType = trendEntryBreakRetest; // Trending Ent
 input enumTrendAddMode TrendAddMode = trendAddProfitRetest; // Trend Add Mode
 input int     TrendEntryMmLevel = 2;                // Trending Entry MM Level for Sell (-2..10, Buy mirrors)
 input enumTf  TrendMM_Timeframe = tfH1;             // Trend Murrey Timeframe
+input int     TrendMM_Lookback = 96;                // Trend Murrey Lookback
 input enumRangeMetric TrendRangeMetric = rangeAtr;  // Trend Dynamic Range Source
 input double  TrendMinIncrementBlock_Pips = 0;      // Trend Min Increment to Block (0=off, neg=ATR/Keltner mult)
 input double  TrendMinIncrementExpand_Pips = 0;     // Trend Min Increment to Expand (0=off, neg=ATR/Keltner mult)
@@ -180,40 +193,41 @@ input double  TrendLotSizeBase = 0.01;              // Trend Base Lot Size
 input double  TrendLotMultiplier = 1.0;             // Trend Lot Multiplier
 input double  TrendMaxLots = 1.0;                   // Trend Max Lots Per Order
 input double  TrendRiskPercent = 0;                 // Trend Risk % (0=use TrendLotSizeBase)
+input double  TrendLockProfitTriggerPips = 0;       // Trend Lock Profit Trigger (pips, neg=ATR/Keltner mult)
+input double  TrendTrailingStop = 5.0;              // Trend Trailing Stop (pips, neg=ATR/Keltner mult)
+input int     TrendLockProfitMinTrades = 0;         // Trend Min Trades for Lock Profit
+input enumTrailFrequency TrendLockProfitCheckFrequency = trailEveryTick; // Trend Lock Trigger Check Frequency
+input enumTrailFrequency TrendTrailFrequency = trailEveryTick; // Trend Trailing SL Update Frequency
 
-//+------------------------------------------------------------------+
-//|  INPUTS - CURRENCY STRENGTH MATRIX                               |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Currency Strength Matrix~~~~~~~~~";
-input bool    UseCurrencyStrengthMatrix = false;    // Use Currency Strength Matrix
-input enumTf  StrengthTimeframe = tfD1;             // Strength Timeframe
-input int     StrengthLookbackBars = 5;             // Strength Lookback (bars on StrengthTimeframe)
-input int     StrengthExtremeCount = 1;             // Strongest/Weakest Buckets (1-2)
+input group "#### Grid & Sequence Management ####";
+input int     MaxOrders = 20;                       // Max Grid Orders
+input bool    BlockOppositeSideStarts = true;       // Block opposite-side sequence starts on same symbol
+input int     GridAddThrottleSeconds = 10;          // Min seconds between grid adds per sequence
+input double  StopLoss = 0;                         // Stop Loss (pips, neg=ATR/Keltner mult, 0=off)
+input double  GridIncrementExponent = 1.0;           // Grid Increment Exponent (1.0=linear)
+input int     CooldownBars = 0;                      // Cooldown (bars after seq close, 0=off)
+input double  MaxLossPerSequence = 0;                // Max Loss Per Sequence $ (0=off)
+input int     MaxOpenSequences = 0;                 // Max Concurrent Open Sequences (0=off)
+input int     MaxSequencesPerDay = 0;                // Max Sequences/Day (0=off)
+input int     MaxDailyWinners = 0;                   // Max Daily Winners (0=off)
+input int     MaxDailyLosers = 0;                    // Max Daily Losers (0=off)
+input enumRestart MaxSequencesRestartEa = restartNextDay; // Restart After Max
 
-//+------------------------------------------------------------------+
-//|  INPUTS - SCANNER                                                |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Scanner Settings~~~~~~~~~";
-input string  Trade_Symbols = "EURUSD,GBPUSD,AUDUSD,NZDUSD,USDJPY,USDCAD,USDCHF,EURJPY,GBPJPY,EURGBP"; // Symbols
-input int     Corr_Lookback = 100;                  // Correlation Lookback (bars)
-input enumTf  Corr_Timeframe = tfH1;                // Correlation Timeframe
-input int     Max_Pairs = 3;                        // Max Active Pairs
-input int     Scanner_IntervalHours = 4;            // Rescan Interval (hours)
-input double  Min_Correlation = 0.80;               // Min |r| Threshold
+//input group "#### MM Levels ####";
+const enumEntryPriceType EntryPriceType = entryOnClose; // Entry Source (Close/Tick)
 
-//+------------------------------------------------------------------+
-//|  INPUTS - Z-SCORE                                                |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Z-Score Settings~~~~~~~~~";
-input int     Z_Lookback = 20;                      // Z-Score Lookback
-input double  Z_BuyThreshold = -2.0;                // Z Buy Threshold (negative)
-input double  Z_SellThreshold = 2.0;                // Z Sell Threshold (positive)
-input bool    UseZScoreEntryFilter = true;          // Require Z thresholds for MR entries
+input group "#### Range Settings ####";
+input enumTf  ATRtimeframe = tfH1;                  // ATR Timeframe
+input int     AtrPeriod = 14;                       // ATR Period
+input enumRangeMetric RangeMetric = rangeAtr;       // Dynamic Range Source for negative multipliers
+input enumTf  KeltnerTimeframe = tfH1;              // Keltner ATR Timeframe
+input int     KeltnerEmaPeriod = 20;                // Keltner EMA Period (centerline)
+input int     KeltnerAtrPeriod = 20;                // Keltner ATR Period
+input double  KeltnerAtrMultiplier = 1.5;           // Keltner ATR Multiplier (band half-width)
+const int     EMA_FilterPeriod = 0;                 // EMA Filter Period (0=off)
+const enumTf  EMA_FilterTimeframe = tfH1;           // EMA Filter Timeframe
 
-//+------------------------------------------------------------------+
-//|  INPUTS - MARKOV FILTER                                          |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Markov Regime Filter~~~~~~~~~";
+input group "#### Markov Regime Filter ####";
 input enumTf  Markov_RegimeTimeframe = tfH1;        // Regime Detection Timeframe
 input int     Markov_Lookback = 50;                 // Momentum Lookback
 input int     Markov_ATRLength = 50;                // ATR Length
@@ -236,6 +250,78 @@ input double  Markov_MinConfidence = 0.65;          // Min Confidence for Direct
 input double  Markov_MinProbGap = 0.10;             // Min (P(up)-P(down)) Gap for Directional Block
 input double  Markov_MinEdge = 0.02;                // Min |Edge| for Directional Block
 
+input group "#### LP-vs-Murrey Filter ####";
+input enumTf  LP_MM_Timeframe = tfH4;                 // LP Filter: Murrey Timeframe
+input int     LP_MM_Lookback = 0;                    // LP Filter: Murrey Lookback (0=off)
+input int     LP_MM_BoundaryEighth = 0;               // LP Filter: Boundary N/8 from 8/8 (neg=inward)
+input bool    UseLpEmaTradeIntoFilter = false;        // LP Filter: Block trades that cross 20/50/200 EMA on M1/M5/M15/H1/H4/D1
+
+input group "#### News Filter ####";
+input bool    UseHighImpactNewsFilter = true;        // Use News Filter
+input int     HoursBeforeNewsToStop = 2;             // Hours Before News
+input int     HoursAfterNewsToStart = 1;             // Hours After News
+input int     MinutesBeforeNewsNoTransactions = 5;   // Min Before (no transactions)
+input int     MinutesAfterNewsNoTransactions = 5;    // Min After (no transactions)
+input bool    UsdAffectsAllPairs = true;             // USD Affects All
+input enumNewsAction NewsAction = newsActionManage;  // News Action
+input bool    NewsInvert = false;                    // Invert News Filter
+input string  NewsInfo = "[Backtesting hardcoded to GMT+2/+3 with US DST]"; // [Info]
+
+input group "#### Global Protections & Session ####";
+input string  SessionStartTime = "00:00";           // Session Start
+input string  SessionEndTime = "23:59";             // Session End
+input ENUM_SESSION_END SessionEndAction = NO_TRADES_FOR_NEW_CYCLE; // End Action
+input ENUM_SESSION_DIR Direction = DIR_BOTH;         // Direction
+input bool    UsePipValueLotNormalization = true;   // Normalize lot size by pip-value ratio across symbols
+input string  PipValueReferenceSymbol = "EURUSD";   // Reference symbol for pip-value normalization
+input bool    NormalizeLotsPerStrategy = true;      // Apply pip normalization to MR/Trend lots
+input enumLockProfitMode LockProfitMode = lpPerSequence; // Lock Profit Scope
+input double  GlobalLockProfitAmount = 0;            // Global Lock: $ Threshold (0=off)
+input double  GlobalTrailingAmount = 0;              // Global Lock: $ Trail From Peak
+input double  GlobalLockProfitPips = 0;              // Global Lock: Pips Threshold (0=off)
+input double  GlobalTrailingPips = 0;                // Global Lock: Pips Trail From Peak
+input enumGlobalEpType GlobalEpType = globalEpAbsolute; // Equity Stop Type
+input double  GlobalEquityStop = 0;                  // Global Equity Stop (0=off)
+input double  UltimateTargetBalance = 0;             // Ultimate Target (0=off)
+input double  ProfitCloseEquityAmount = 0;           // Daily Profit Target (0=off)
+input enumRestart RestartEaAfterLoss = restartNextDay; // Restart After Loss
+input string  TimeOfRestart_Equity = "01:00";        // Restart Time
+input int     RestartInHours = 0;                    // Restart In Hours
+input bool    RescueCloseInDrawdown = false;         // Close In Drawdown If Net Profit
+input double  RescueDrawdownThreshold = 0;           // Rescue DD Threshold $ (0=off)
+
+input group "#### Weekend Closure ####";
+input bool    CloseAllTradesDisableEA = false;       // Close All Friday
+input int     DayToClose = 5;                        // Day To Close (5=Fri)
+input string  TimeToClose = "20:00";                 // Time To Close
+input bool    RestartEA_AfterFridayClose = true;     // Restart After Weekend
+input int     DayToRestart = 1;                      // Day To Restart (1=Mon)
+input string  TimeToRestart = "01:00";               // Time To Restart
+
+input group "#### General & Appearance ####";
+input bool    EnableLogging = true;                 // Enable Logging
+input double  MaxSpreadPips = 3.0;                  // Max Spread (pips, 0=off)
+input bool    ShowDashboard = true;                  // Show Panel
+input ENUM_STRATEGY_TYPE DashboardButtonStrategyDefault = STRAT_MEAN_REVERSION; // Dashboard Buy/Sell open strategy
+const int     X_Axis = 10;                           // X Position
+const int     Y_Axis = 30;                           // Y Position
+input enumVisualTheme VisualTheme = themeDark;       // Dashboard/Chart Theme
+const int     DashboardWidthPx = 820;                // Fixed Dashboard Width
+const int     DashboardHeightPx = 520;               // Fixed Dashboard Height
+const bool    DashboardAutoHeight = true;            // Auto height by content/news
+const int     DashboardMinHeightPx = 100;            // Min height when auto
+input bool    EnablePerfTiming = false;              // Log internal timing metrics (tester)
+input int     PerfLogEveryNBars = 50;                // Timing log cadence (bars)
+
+input group "#### Legacy Inputs ####";
+input bool    AllowNewSequence = true;              // Global gate for opening brand-new sequences
+input double  LotSize = 0.01;                       // [Legacy] Base Lot Size
+input double  LotSizeExponent = 1.0;                // [Legacy] Lot Multiplier
+input double  MaxLots = 1.0;                        // [Legacy] Max Lots Per Order
+input double  RiskPercent = 0;                      // [Legacy] Risk % (0=use LotSize)
+input double  MinIncrementBlock_Pips = 0;            // [Legacy] Min Increment to Block (0=off, neg=ATR/Keltner mult)
+input double  MinIncrementExpand_Pips = 0;           // [Legacy] Min Increment to Expand (0=off, neg=ATR/Keltner mult)
+
 //+------------------------------------------------------------------+
 //|  LEGACY DISABLED FEATURES (kept for compile compatibility)       |
 //+------------------------------------------------------------------+
@@ -255,179 +341,6 @@ double  StagnationDecayHours = 0;
 double  StagnationHedgeHours = 0;
 double  StagnationHedgeDrawdownAmount = 0;
 double  StagnationUnwindNetThreshold = 0.0;
-
-//+------------------------------------------------------------------+
-//|  INPUTS - EMA FILTER                                             |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~EMA Filter~~~~~~~~~";
-input int     EMA_FilterPeriod = 0;                 // EMA Filter Period (0=off)
-input enumTf  EMA_FilterTimeframe = tfH1;           // EMA Filter Timeframe
-
-//+------------------------------------------------------------------+
-//|  INPUTS - MURREY MATH                                            |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Murrey Math Settings~~~~~~~~~";
-input int     MM_Lookback = 96;                     // Murrey Math Lookback
-input enumTf  MM_Timeframe = tfH1;                  // Murrey Math Timeframe
-input enumEntryPriceType EntryPriceType = entryOnClose; // Entry Source (Close/Tick)
-input int     EntryMmLevel = 8;                     // Entry MM Level for Sell (-2..10, Buy mirrors as 8-level)
-
-//+------------------------------------------------------------------+
-//|  INPUTS - ATR                                                    |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~ATR / Range~~~~~~~~~";
-input enumTf  ATRtimeframe = tfH1;                  // ATR Timeframe
-input int     AtrPeriod = 14;                       // ATR Period
-input enumRangeMetric RangeMetric = rangeAtr;       // Dynamic Range Source for negative multipliers
-input enumTf  KeltnerTimeframe = tfH1;              // Keltner ATR Timeframe
-input int     KeltnerEmaPeriod = 20;                // Keltner EMA Period (centerline)
-input int     KeltnerAtrPeriod = 20;                // Keltner ATR Period
-input double  KeltnerAtrMultiplier = 1.5;           // Keltner ATR Multiplier (band half-width)
-
-//+------------------------------------------------------------------+
-//|  INPUTS - SESSION                                                |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Trading Session~~~~~~~~~";
-input string  SessionStartTime = "00:00";           // Session Start
-input string  SessionEndTime = "23:59";             // Session End
-input ENUM_SESSION_END SessionEndAction = NO_TRADES_FOR_NEW_CYCLE; // End Action
-input ENUM_SESSION_DIR Direction = DIR_BOTH;         // Direction
-
-//+------------------------------------------------------------------+
-//|  INPUTS - LOT SIZING                                             |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Lot Sizing~~~~~~~~~";
-input double  LotSize = 0.01;                       // [Legacy] Base Lot Size
-input double  LotSizeExponent = 1.0;                // [Legacy] Lot Multiplier
-input double  MaxLots = 1.0;                        // [Legacy] Max Lots Per Order
-input double  RiskPercent = 0;                      // [Legacy] Risk % (0=use LotSize)
-input bool    UsePipValueLotNormalization = true;   // Normalize lot size by pip-value ratio across symbols
-input string  PipValueReferenceSymbol = "EURUSD";   // Reference symbol for pip-value normalization
-input bool    NormalizeLotsPerStrategy = true;      // Apply pip normalization to MR/Trend lots
-// Migration notes (old -> new strategy-specific):
-// LotSize/LotSizeExponent/MaxLots/RiskPercent -> MrLotSize/MrLotMultiplier/MrMaxLots/MrRiskPercent and Trend* equivalents
-// SessionStartTime/SessionEndTime/SessionEndAction -> MrSession* and TrendSession*
-// MM_Timeframe/RangeMetric/MinIncrement* -> Mr* and Trend* strategy configs
-
-//+------------------------------------------------------------------+
-//|  INPUTS - GRID & TARGETS                                         |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Grid & Targets~~~~~~~~~";
-input int     MaxOrders = 20;                       // Max Grid Orders
-input bool    BlockOppositeSideStarts = true;       // Block opposite-side sequence starts on same symbol
-input int     GridAddThrottleSeconds = 10;          // Min seconds between grid adds per sequence
-input double  StopLoss = 0;                         // Stop Loss (pips, neg=ATR/Keltner mult, 0=off)
-input double  LockProfitTriggerPips = 0;            // MR Lock Profit Trigger (pips, neg=ATR/Keltner mult)
-input double  TrailingStop = 5.0;                   // MR Trailing Stop (pips, neg=ATR/Keltner mult)
-input int     LockProfitMinTrades = 0;              // MR Min Trades for Lock Profit
-input enumTrailFrequency LockProfitCheckFrequency = trailEveryTick; // MR Lock Trigger Check Frequency
-input enumTrailFrequency TrailFrequency = trailEveryTick; // MR Trailing SL Update Frequency
-input group "~~~~~~~~~Trending Lock/Trail~~~~~~~~~";
-input double  TrendLockProfitTriggerPips = 0;       // Trend Lock Profit Trigger (pips, neg=ATR/Keltner mult)
-input double  TrendTrailingStop = 5.0;              // Trend Trailing Stop (pips, neg=ATR/Keltner mult)
-input int     TrendLockProfitMinTrades = 0;         // Trend Min Trades for Lock Profit
-input enumTrailFrequency TrendLockProfitCheckFrequency = trailEveryTick; // Trend Lock Trigger Check Frequency
-input enumTrailFrequency TrendTrailFrequency = trailEveryTick; // Trend Trailing SL Update Frequency
-input enumLockProfitMode LockProfitMode = lpPerSequence; // Lock Profit Scope
-input double  GlobalLockProfitAmount = 0;            // Global Lock: $ Threshold (0=off)
-input double  GlobalTrailingAmount = 0;              // Global Lock: $ Trail From Peak
-input double  GlobalLockProfitPips = 0;              // Global Lock: Pips Threshold (0=off)
-input double  GlobalTrailingPips = 0;                // Global Lock: Pips Trail From Peak
-
-input group "~~~~~~~~~Grid Increment Control~~~~~~~~~";
-input double  MinIncrementBlock_Pips = 0;            // [Legacy] Min Increment to Block (0=off, neg=ATR/Keltner mult)
-input double  MinIncrementExpand_Pips = 0;           // [Legacy] Min Increment to Expand (0=off, neg=ATR/Keltner mult)
-input double  GridIncrementExponent = 1.0;           // Grid Increment Exponent (1.0=linear)
-
-input group "~~~~~~~~~LP-vs-Murrey Filter~~~~~~~~~";
-input enumTf  LP_MM_Timeframe = tfH4;                 // LP Filter: Murrey Timeframe
-input int     LP_MM_Lookback = 0;                    // LP Filter: Murrey Lookback (0=off)
-input int     LP_MM_BoundaryEighth = 0;               // LP Filter: Boundary N/8 from 8/8 (neg=inward)
-input bool    UseLpEmaTradeIntoFilter = false;        // LP Filter: Block trades that cross 20/50/200 EMA on M1/M5/M15/H1/H4/D1
-
-// Stagnation rescue removed.
-
-//+------------------------------------------------------------------+
-//|  INPUTS - WEEKEND                                                |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Weekend Closure~~~~~~~~~";
-input bool    CloseAllTradesDisableEA = false;       // Close All Friday
-input int     DayToClose = 5;                        // Day To Close (5=Fri)
-input string  TimeToClose = "20:00";                 // Time To Close
-input bool    RestartEA_AfterFridayClose = true;     // Restart After Weekend
-input int     DayToRestart = 1;                      // Day To Restart (1=Mon)
-input string  TimeToRestart = "01:00";               // Time To Restart
-
-//+------------------------------------------------------------------+
-//|  INPUTS - NEWS FILTER                                            |
-//+------------------------------------------------------------------+
-input group "~~~~News Filter [2026.02.27]~~~~~";
-input bool    UseHighImpactNewsFilter = true;        // Use News Filter
-input int     HoursBeforeNewsToStop = 2;             // Hours Before News
-input int     HoursAfterNewsToStart = 1;             // Hours After News
-input int     MinutesBeforeNewsNoTransactions = 5;   // Min Before (no transactions)
-input int     MinutesAfterNewsNoTransactions = 5;    // Min After (no transactions)
-input bool    UsdAffectsAllPairs = true;             // USD Affects All
-input enumNewsAction NewsAction = newsActionManage;  // News Action
-input bool    NewsInvert = false;                    // Invert News Filter
-input string  NewsInfo = "[Backtesting hardcoded to GMT+2/+3 with US DST]"; // [Info]
-
-//+------------------------------------------------------------------+
-//|  INPUTS - SEQUENCE LIMITS                                        |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Sequence Limits~~~~~~~~~";
-input int     MaxOpenSequences = 0;                 // Max Concurrent Open MR Sequences (0=off)
-input int     MaxSequencesPerDay = 0;                // Max Sequences/Day (0=off)
-input int     MaxDailyWinners = 0;                   // Max Daily Winners (0=off)
-input int     MaxDailyLosers = 0;                    // Max Daily Losers (0=off)
-input enumRestart MaxSequencesRestartEa = restartNextDay; // Restart After Max
-input group "~~~~~~~~~Decision Engine~~~~~~~~~";
-input ENUM_DECISION_MODE DecisionMode = decisionLegacyParity; // Legacy parity or ranked deterministic
-input ENUM_STRATEGY_TIEBREAK StrategyTieBreak = stratTrendFirst; // Strategy priority when capped
-input ENUM_SIDE_TIEBREAK SideTieBreak = sideBuyFirst; // Side priority when capped
-input int     MaxStartsPerBar = 0;                   // Max sequence starts per bar (0=off)
-input int     MaxAddsPerBar = 0;                     // Max grid adds per bar (0=off)
-
-//+------------------------------------------------------------------+
-//|  INPUTS - SEQUENCE PROTECTION                                    |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Sequence Protection~~~~~~~~~";
-input double  MaxLossPerSequence = 0;                // Max Loss Per Sequence $ (0=off)
-input bool    EnableZScoreExit = false;               // Z-Score Exit Filter
-input double  Z_ExitThreshold = 0;                   // Z Exit Threshold (close when Z crosses 0)
-input bool    EnableCorrGuard = false;                // Correlation Breakdown Guard
-input double  CorrBreakdownThreshold = 0.5;           // Min Live |r| (force-close below)
-input int     CooldownBars = 0;                      // Cooldown (bars after seq close, 0=off)
-
-//+------------------------------------------------------------------+
-//|  INPUTS - GLOBAL EQUITY PROTECTION                               |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Global Equity Protection~~~~~~~~~";
-input enumGlobalEpType GlobalEpType = globalEpAbsolute; // Equity Stop Type
-input double  GlobalEquityStop = 0;                  // Global Equity Stop (0=off)
-input double  UltimateTargetBalance = 0;             // Ultimate Target (0=off)
-input double  ProfitCloseEquityAmount = 0;           // Daily Profit Target (0=off)
-input enumRestart RestartEaAfterLoss = restartNextDay; // Restart After Loss
-input string  TimeOfRestart_Equity = "01:00";        // Restart Time
-input int     RestartInHours = 0;                    // Restart In Hours
-input bool    RescueCloseInDrawdown = false;         // Close In Drawdown If Net Profit
-input double  RescueDrawdownThreshold = 0;           // Rescue DD Threshold $ (0=off)
-
-//+------------------------------------------------------------------+
-//|  INPUTS - DASHBOARD                                              |
-//+------------------------------------------------------------------+
-input group "~~~~~~~~~Dashboard~~~~~~~~~";
-input bool    ShowDashboard = true;                  // Show Panel
-input ENUM_STRATEGY_TYPE DashboardButtonStrategyDefault = STRAT_MEAN_REVERSION; // Dashboard Buy/Sell open strategy
-const int     X_Axis = 10;                           // X Position
-const int     Y_Axis = 30;                           // Y Position
-input enumVisualTheme VisualTheme = themeDark;       // Dashboard/Chart Theme
-const int     DashboardWidthPx = 820;                // Fixed Dashboard Width
-const int     DashboardHeightPx = 520;               // Fixed Dashboard Height
-const bool    DashboardAutoHeight = true;            // Auto height by content/news
-const int     DashboardMinHeightPx = 100;            // Min height when auto
-input bool    EnablePerfTiming = false;              // Log internal timing metrics (tester)
-input int     PerfLogEveryNBars = 50;                // Timing log cadence (bars)
 
 //+------------------------------------------------------------------+
 //|  NEWS DATA INCLUDE                                               |
@@ -2021,9 +1934,10 @@ bool CachedCalcMurreyLevelsForSymbol(const string symbol,
                                      double &mm88, double &mm48, double &mm08, double &inc,
                                      double &p28, double &p18, double &m18, double &m28)
   {
+   // Fallback uses MR settings if strategy-specific context is missing
    return CachedCalcMurreyLevelsForSymbolCustom(symbol,
-                                                (ENUM_TIMEFRAMES)MM_Timeframe,
-                                                MM_Lookback,
+                                                (ENUM_TIMEFRAMES)MrMM_Timeframe,
+                                                MrMM_Lookback,
                                                 mm88, mm48, mm08, inc, p28, p18, m18, m28);
   }
 
@@ -2579,41 +2493,13 @@ void RunScanner()
      {
       for(int j = i + 1; j < numSymbols; j++)
         {
-         double r = 1.0;
-         if(Min_Correlation > 0)
-            r = CalcPearsonCorrelation(allSymbols[i], allSymbols[j]);
-            
-         double absR = MathAbs(r);
-         if(absR < Min_Correlation)
-            continue;
-         double rankScore = absR;
-
          combos[numCombos].idxA = i;
          combos[numCombos].idxB = j;
-         combos[numCombos].r = r;
-         combos[numCombos].absR = absR;
-         combos[numCombos].score = rankScore;
+         combos[numCombos].score = 1.0;
          numCombos++;
         }
      }
    ArrayResize(combos, numCombos);
-
-// Sort by score descending (selection sort, deterministic and lighter than bubble).
-   for(int i = 0; i < numCombos - 1; i++)
-     {
-      int best = i;
-      for(int j = i + 1; j < numCombos; j++)
-        {
-         if(combos[j].score > combos[best].score)
-            best = j;
-        }
-      if(best != i)
-        {
-         CorrPair tmp = combos[i];
-         combos[i] = combos[best];
-         combos[best] = tmp;
-        }
-     }
 
    ActivePair newPairs[];
    ArrayResize(newPairs, 0);
@@ -2661,7 +2547,6 @@ void RunScanner()
          newPairs[selected].symbolB = sB;
          newPairs[selected].recoveryManagedOnly = false;
          newPairs[selected].score = 0.0;
-         newPairs[selected].zScore = 0;
          newPairs[selected].entry_mm_08 = 0;
          newPairs[selected].entry_mm_minus18 = 0;
          newPairs[selected].entry_mm_minus28 = 0;
@@ -2674,7 +2559,6 @@ void RunScanner()
       // Update fields that may change on rescan
       if(carried)
          newPairs[selected].recoveryManagedOnly = false;
-      newPairs[selected].correlation = combos[i].r;
       newPairs[selected].score = combos[i].score;
       newPairs[selected].active = true;
       newPairs[selected].tradingEnabled = true;
@@ -2684,7 +2568,6 @@ void RunScanner()
 
       if(EnableLogging)
          Print("[Scanner] Selected: ", sA, " vs ", sB,
-               " r=", DoubleToString(combos[i].r, 4),
                " score=", DoubleToString(combos[i].score, 3),
                carried ? " (state preserved)" : " (new)");
      }
@@ -2762,9 +2645,7 @@ void RunScanner()
       ArrayResize(newPairs, selected + 1);
       newPairs[selected].symbolA = posSymbol;
       newPairs[selected].symbolB = posSymbol; // Placeholder for management-only recovery
-      newPairs[selected].correlation = 0;
       newPairs[selected].score = 0.0;
-      newPairs[selected].zScore = 0;
       newPairs[selected].active = true;
       newPairs[selected].tradingEnabled = false;
       newPairs[selected].recoveryManagedOnly = true;
@@ -3122,7 +3003,16 @@ void ReconstructSequenceMemory(int seqIdx, int pairIdx)
    string seqSym = GetSequenceTradeSymbol(seqIdx, pairIdx);
    double mm88 = 0, mm48 = 0, mm08 = 0, mmInc = 0;
    double mmP28 = 0, mmP18 = 0, mmM18 = 0, mmM28 = 0;
-   if(!CachedCalcMurreyLevelsForSymbol(seqSym, mm88, mm48, mm08, mmInc, mmP28, mmP18, mmM18, mmM28))
+   
+   ENUM_TIMEFRAMES tf = (ENUM_TIMEFRAMES)MrMM_Timeframe;
+   int lookback = MrMM_Lookback;
+   if(g_seqMgr.m_sequences[seqIdx].strategyType == STRAT_TRENDING)
+     {
+      tf = (ENUM_TIMEFRAMES)TrendMM_Timeframe;
+      lookback = TrendMM_Lookback;
+     }
+
+   if(!CachedCalcMurreyLevelsForSymbolCustom(seqSym, tf, lookback, mm88, mm48, mm08, mmInc, mmP28, mmP18, mmM18, mmM28))
       return;
    int side = g_seqMgr.m_sequences[seqIdx].side;
    if(side == SIDE_BUY)
@@ -6235,7 +6125,6 @@ void OnTick()
       for(int p = 0; p < numActivePairs; p++)
         {
          CalcMurreyLevels(p);
-         CalcZScore(p);
         }
      }
 
@@ -6248,7 +6137,6 @@ void OnTick()
       for(int p = 0; p < numActivePairs; p++)
         {
          CalcMurreyLevels(p);
-         CalcZScore(p);
          if(AnyStrategyMarkovEnabled())
            {
             if(EnablePerfTiming && markovUsStart == 0)
@@ -6307,7 +6195,6 @@ void OnTick()
 
          double mmInc = activePairs[p].mmIncrement;
          double mmIncB = activePairs[p].mmIncrementB;
-         double zScore = activePairs[p].zScore;  // log-spread z-score (from CalcZScore)
          string sym = symA; // pair label / legacy logging
          int bIdx = activePairs[p].buySeqIdx;
          int sIdx = activePairs[p].sellSeqIdx;
@@ -6361,12 +6248,11 @@ void OnTick()
                                            (buyIsTrend ? TrendLockProfitCheckFrequency : LockProfitCheckFrequency);
             if(checkFreq == trailEveryTick)
                doTrailBuy = true;
-            else
-               if(checkFreq == trailAtCloseOfBarM1 && newBarM1)
-                  doTrailBuy = true;
-               else
-                  if(checkFreq == trailAtCloseOfBarChart && newBar)
-                     doTrailBuy = true;
+            else if(checkFreq == trailAtCloseOfBarM1 && newBarM1)
+               doTrailBuy = true;
+            else if(checkFreq == trailAtCloseOfBarChart && newBar)
+               doTrailBuy = true;
+
             if(doTrailBuy)
                TrailingForSequence(bIdx, p);
            }
@@ -6381,64 +6267,13 @@ void OnTick()
                                            (sellIsTrend ? TrendLockProfitCheckFrequency : LockProfitCheckFrequency);
             if(checkFreq == trailEveryTick)
                doTrailSell = true;
-            else
-               if(checkFreq == trailAtCloseOfBarM1 && newBarM1)
-                  doTrailSell = true;
-               else
-                  if(checkFreq == trailAtCloseOfBarChart && newBar)
-                     doTrailSell = true;
+            else if(checkFreq == trailAtCloseOfBarM1 && newBarM1)
+               doTrailSell = true;
+            else if(checkFreq == trailAtCloseOfBarChart && newBar)
+               doTrailSell = true;
+
             if(doTrailSell)
                TrailingForSequence(sIdx, p);
-           }
-         if(EnableZScoreExit && newBar)
-           {
-            // Close BUY sequence when Z-Score reverts above exit threshold (mean reversion complete)
-            if(g_seqMgr.m_sequences[bIdx].tradeCount > 0 &&
-               g_seqMgr.m_sequences[bIdx].strategyType == STRAT_MEAN_REVERSION)
-              {
-               if(activePairs[p].zScore >= Z_ExitThreshold)
-                 {
-                  if(EnableLogging)
-                     Print("[ZExit] BUY closed for pair ", p,
-                           " ", sym, " Z=", DoubleToString(activePairs[p].zScore, 2),
-                           " crossed exit threshold ", DoubleToString(Z_ExitThreshold, 2));
-                  AsyncCloseSequence(bIdx, "Z-Score Exit (Z=" + DoubleToString(activePairs[p].zScore, 2) + ")");
-                 }
-              }
-            // Close SELL sequence when Z-Score reverts below negative exit threshold
-            if(g_seqMgr.m_sequences[sIdx].tradeCount > 0 &&
-               g_seqMgr.m_sequences[sIdx].strategyType == STRAT_MEAN_REVERSION)
-              {
-               if(activePairs[p].zScore <= -Z_ExitThreshold)
-                 {
-                  if(EnableLogging)
-                     Print("[ZExit] SELL closed for pair ", p,
-                           " ", sym, " Z=", DoubleToString(activePairs[p].zScore, 2),
-                           " crossed exit threshold -", DoubleToString(Z_ExitThreshold, 2));
-                  AsyncCloseSequence(sIdx, "Z-Score Exit (Z=" + DoubleToString(activePairs[p].zScore, 2) + ")");
-                 }
-              }
-           }
-
-         // === CORRELATION BREAKDOWN GUARD ===
-         if(EnableCorrGuard && newBar &&
-            (g_seqMgr.m_sequences[bIdx].tradeCount > 0 || g_seqMgr.m_sequences[sIdx].tradeCount > 0))
-           {
-            // Recalculate live correlation for this pair
-            double liveCorr = CalcPearsonCorrelation(activePairs[p].symbolA, activePairs[p].symbolB);
-            activePairs[p].correlation = liveCorr;  // update stored value
-            if(MathAbs(liveCorr) < CorrBreakdownThreshold)
-              {
-               if(EnableLogging)
-                  Print("[CorrGuard] Correlation breakdown for pair ", p,
-                        " ", activePairs[p].symbolA, "/", activePairs[p].symbolB,
-                        " |r|=", DoubleToString(MathAbs(liveCorr), 3),
-                        " < ", DoubleToString(CorrBreakdownThreshold, 2));
-               if(g_seqMgr.m_sequences[bIdx].tradeCount > 0)
-                  AsyncCloseSequence(bIdx, "Corr Breakdown (r=" + DoubleToString(liveCorr, 3) + ")");
-               if(g_seqMgr.m_sequences[sIdx].tradeCount > 0)
-                  AsyncCloseSequence(sIdx, "Corr Breakdown (r=" + DoubleToString(liveCorr, 3) + ")");
-              }
            }
 
          // ---- ENTRIES: Only on new bar + session open ----
@@ -6478,34 +6313,31 @@ void OnTick()
 
          double mm88B = 0, mm48B = 0, mm08B = 0;
          double mmP28B = 0, mmP18B = 0, mmM18B = 0, mmM28B = 0;
-         if(!CachedCalcMurreyLevelsForSymbol(symB, mm88B, mm48B, mm08B, mmIncB, mmP28B, mmP18B, mmM18B, mmM28B))
+         // Primary lookup uses MR settings as the baseline for activePairs sync
+         if(!CachedCalcMurreyLevelsForSymbolCustom(symB, (ENUM_TIMEFRAMES)MrMM_Timeframe, MrMM_Lookback, mm88B, mm48B, mm08B, mmIncB, mmP28B, mmP18B, mmM18B, mmM28B))
             continue;
 
-         // Strategy-specific Murrey snapshots for start conditions.
-         double mrMm88A = activePairs[p].mm_88, mrMm08A = activePairs[p].mm_08, mrIncA = mmInc;
-         double mrMmP28A = activePairs[p].mm_plus28, mrMmP18A = activePairs[p].mm_plus18;
-         double mrMmM18A = activePairs[p].mm_minus18, mrMmM28A = activePairs[p].mm_minus28;
-         double mrMm88B = mm88B, mrMm08B = mm08B, mrIncB = mmIncB;
-         double mrMmP28B = mmP28B, mrMmP18B = mmP18B, mrMmM18B = mmM18B, mrMmM28B = mmM28B;
-         ENUM_TIMEFRAMES mrTf = GetStrategyMMTimeframe(STRAT_MEAN_REVERSION);
-         if(mrTf != (ENUM_TIMEFRAMES)MM_Timeframe)
-           {
-            double mrMm48A = 0.0, mrMm48B = 0.0;
-            CachedCalcMurreyLevelsForSymbolCustom(symA, mrTf, MM_Lookback, mrMm88A, mrMm48A, mrMm08A, mrIncA, mrMmP28A, mrMmP18A, mrMmM18A, mrMmM28A);
-            CachedCalcMurreyLevelsForSymbolCustom(symB, mrTf, MM_Lookback, mrMm88B, mrMm48B, mrMm08B, mrIncB, mrMmP28B, mrMmP18B, mrMmM18B, mrMmM28B);
-           }
+          // Strategy-specific Murrey snapshots for start conditions.
+          // MR baseline is already updated by the scanner using MrMM_Timeframe/Lookback
+          double mrMm88A = activePairs[p].mm_88, mrMm08A = activePairs[p].mm_08, mrIncA = mmInc;
+          double mrMmP28A = activePairs[p].mm_plus28, mrMmP18A = activePairs[p].mm_plus18;
+          double mrMmM18A = activePairs[p].mm_minus18, mrMmM28A = activePairs[p].mm_minus28;
+          double mrMm88B = mm88B, mrMm08B = mm08B, mrIncB = mmIncB;
+          double mrMmP28B = mmP28B, mrMmP18B = mmP18B, mrMmM18B = mmM18B, mrMmM28B = mmM28B;
 
-         double trMm88A = activePairs[p].mm_88, trMm08A = activePairs[p].mm_08, trIncA = mmInc;
-         double trMm88B = mm88B, trMm08B = mm08B, trIncB = mmIncB;
-         ENUM_TIMEFRAMES trTf = GetStrategyMMTimeframe(STRAT_TRENDING);
-         if(trTf != (ENUM_TIMEFRAMES)MM_Timeframe)
-           {
-            double trMm48A = 0.0, trMm48B = 0.0;
-            double trMmP28A = 0.0, trMmP18A = 0.0, trMmM18A = 0.0, trMmM28A = 0.0;
-            double trMmP28B = 0.0, trMmP18B = 0.0, trMmM18B = 0.0, trMmM28B = 0.0;
-            CachedCalcMurreyLevelsForSymbolCustom(symA, trTf, MM_Lookback, trMm88A, trMm48A, trMm08A, trIncA, trMmP28A, trMmP18A, trMmM18A, trMmM28A);
-            CachedCalcMurreyLevelsForSymbolCustom(symB, trTf, MM_Lookback, trMm88B, trMm48B, trMm08B, trIncB, trMmP28B, trMmP18B, trMmM18B, trMmM28B);
-           }
+          double trMm88A = activePairs[p].mm_88, trMm08A = activePairs[p].mm_08, trIncA = mmInc;
+          double trMm88B = mm88B, trMm08B = mm08B, trIncB = mmIncB;
+          double trMm48A = 0.0, trMm48B = 0.0;
+          double trMmP28A = 0.0, trMmP18A = 0.0, trMmM18A = 0.0, trMmM28A = 0.0;
+          double trMmP28B = 0.0, trMmP18B = 0.0, trMmM18B = 0.0, trMmM28B = 0.0;
+          
+          ENUM_TIMEFRAMES trTf = (ENUM_TIMEFRAMES)TrendMM_Timeframe;
+          // If Trending uses a different timeframe or lookback than the scanner (MR), recalculate
+          if(trTf != (ENUM_TIMEFRAMES)MrMM_Timeframe || TrendMM_Lookback != MrMM_Lookback)
+            {
+             CachedCalcMurreyLevelsForSymbolCustom(symA, trTf, TrendMM_Lookback, trMm88A, trMm48A, trMm08A, trIncA, trMmP28A, trMmP18A, trMmM18A, trMmM28A);
+             CachedCalcMurreyLevelsForSymbolCustom(symB, trTf, TrendMM_Lookback, trMm88B, trMm48B, trMm08B, trIncB, trMmP28B, trMmP18B, trMmM18B, trMmM28B);
+            }
          if(mrIncA <= EPS && mrIncB <= EPS && trIncA <= EPS && trIncB <= EPS)
             continue;
 
@@ -6731,8 +6563,6 @@ void OnTick()
             double mrAnchor1 = 0, mrAnchor2 = 0, mrAnchor3 = 0;
             double bestBreach = -1e10;
 
-            bool zPass = isBuy ? (!UseZScoreEntryFilter || activePairs[p].zScore <= Z_BuyThreshold)
-                               : (!UseZScoreEntryFilter || activePairs[p].zScore >= Z_SellThreshold);
             // [MR_DIAG]: one line per new bar per pair/side showing why entry fires or not.
             // Set EnableLogging=false to silence. Check Experts log for these lines.
             if(EnableLogging)
@@ -6750,13 +6580,10 @@ void OnTick()
                      " blkThr=", DoubleToString(dBlkThr, digitsA),
                      " hit=",  (dPriceHit?"Y":"N"),
                      " blk=",  (dIncBlk?"Y":"N"),
-                     " zOk=",  (zPass?"Y":"N"),
                      " sess=", (mrSessionOpen?"Y":"N"),
                      " sprdPips=", DoubleToString(spreadA > 0 ? spreadA/SymbolInfoDouble(symA,SYMBOL_POINT) : 0, 1),
                      "/", DoubleToString(MaxSpreadPips, 1));
               }
-            if(zPass)
-              {
                double levelA = isBuy ? buyEntryLevelPriceA : sellEntryLevelPriceA;
                double levelB = isBuy ? buyEntryLevelPriceB : sellEntryLevelPriceB;
                double crossA = isBuy ? downCrossA : upCrossA;
@@ -6823,7 +6650,7 @@ void OnTick()
                        }
                     }
                  }
-              }
+
 
             bool onCooldown = false;
             if(StringLen(mrEntrySym) > 0 && CooldownBars > 0)
@@ -6888,7 +6715,6 @@ void OnTick()
               {
                if(EnableLogging)
                   Print("[Entry] SNIPER ", (isBuy ? "BUY" : "SELL"), ": ", mrEntrySym,
-                        " Z=", DoubleToString(activePairs[p].zScore, 2),
                         " ", (isBuy ? downPriceLabel : upPriceLabel), "=",
                         DoubleToString(mrEntryCross, mrEntryDigits),
                         " mm", IntegerToString(isBuy ? buyEntryLevelEighth : sellEntryLevelEighth),

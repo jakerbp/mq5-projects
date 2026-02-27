@@ -127,7 +127,7 @@ bool CalcMurreyLevelsForSymbolCustom(string sym, ENUM_TIMEFRAMES mmTf, int mmLoo
 bool CalcMurreyLevelsForSymbol(string sym, double &mm_88, double &mm_48, double &mm_08, double &mmIncrement,
                                double &mm_plus28, double &mm_plus18, double &mm_minus18, double &mm_minus28)
   {
-   return CalcMurreyLevelsForSymbolCustom(sym, (ENUM_TIMEFRAMES)MM_Timeframe, MM_Lookback,
+   return CalcMurreyLevelsForSymbolCustom(sym, (ENUM_TIMEFRAMES)MrMM_Timeframe, MrMM_Lookback,
                                           mm_88, mm_48, mm_08, mmIncrement,
                                           mm_plus28, mm_plus18, mm_minus18, mm_minus28);
   }
@@ -145,7 +145,7 @@ void CalcMurreyLevels(int pairIdx)
      {
       int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       Print("[MurreyLevels] ", sym,
-            " TF=", EnumToString((ENUM_TIMEFRAMES)MM_Timeframe),
+            " TF=", EnumToString((ENUM_TIMEFRAMES)MrMM_Timeframe),
             " inc=",  DoubleToString(mmInc, d),
             " +2/8=", DoubleToString(mmP28, d),
             " +1/8=", DoubleToString(mmP18, d),
@@ -164,86 +164,4 @@ void CalcMurreyLevels(int pairIdx)
    activePairs[pairIdx].mm_minus18 = mmM18;
    activePairs[pairIdx].mm_minus28 = mmM28;
    activePairs[pairIdx].mmIncrement = mmInc;
-  }
-
-//+------------------------------------------------------------------+
-//|  PEARSON CORRELATION (log-return based)                          |
-//|  Uses log(close[i]/close[i-1]) to remove price-level trend bias. |
-//+------------------------------------------------------------------+
-double CalcPearsonCorrelation(string symA, string symB)
-  {
-   ENUM_TIMEFRAMES tf = (ENUM_TIMEFRAMES)Corr_Timeframe;
-   // Need one extra bar to compute returns
-   int need = Corr_Lookback + 1;
-   double closeA[], closeB[];
-   int copiedA = CopyClose(symA, tf, 1, need, closeA);
-   int copiedB = CopyClose(symB, tf, 1, need, closeB);
-   if(copiedA < need || copiedB < need)
-      return 0.0;
-
-   int n = Corr_Lookback;
-   double retA[], retB[];
-   ArrayResize(retA, n);
-   ArrayResize(retB, n);
-   for(int i = 0; i < n; i++)
-     {
-      // closeA[0] = newest bar, closeA[need-1] = oldest. Returns are forward in array.
-      retA[i] = (closeA[i + 1] > EPS) ? MathLog(closeA[i] / closeA[i + 1]) : 0.0;
-      retB[i] = (closeB[i + 1] > EPS) ? MathLog(closeB[i] / closeB[i + 1]) : 0.0;
-     }
-
-   double sumX=0, sumY=0, sumXY=0, sumX2=0, sumY2=0;
-   for(int i = 0; i < n; i++)
-     {
-      sumX  += retA[i];
-      sumY  += retB[i];
-      sumXY += retA[i] * retB[i];
-      sumX2 += retA[i] * retA[i];
-      sumY2 += retB[i] * retB[i];
-     }
-   double denom = MathSqrt(MathMax(0.0, (n*sumX2 - sumX*sumX) * (n*sumY2 - sumY*sumY)));
-   if(denom < EPS)
-      return 0.0;
-   return (n*sumXY - sumX*sumY) / denom;
-  }
-
-//+------------------------------------------------------------------+
-//|  Z-SCORE CALCULATION (log-spread based)                          |
-//|  Uses log(closeA/closeB) which is stationary for cointegrated    |
-//|  pairs — mean and stddev are scale-independent and meaningful.   |
-//+------------------------------------------------------------------+
-void CalcZScore(int pairIdx)
-  {
-   string symA = activePairs[pairIdx].symbolA;
-   string symB = activePairs[pairIdx].symbolB;
-   double closeA[], closeB[];
-   int copiedA = CopyClose(symA, PERIOD_CURRENT, 1, Z_Lookback, closeA);
-   int copiedB = CopyClose(symB, PERIOD_CURRENT, 1, Z_Lookback, closeB);
-   if(copiedA < Z_Lookback || copiedB < Z_Lookback)
-     {
-      activePairs[pairIdx].zScore = 0;
-      return;
-     }
-
-   // Log-spread: log(A/B) — stationary for cointegrated pairs, scale-free
-   double spreads[];
-   ArrayResize(spreads, Z_Lookback);
-   for(int i = 0; i < Z_Lookback; i++)
-     {
-      spreads[i] = (closeB[i] > EPS) ? MathLog(closeA[i] / closeB[i]) : 0.0;
-     }
-
-   double mean = 0;
-   for(int i = 0; i < Z_Lookback; i++)
-      mean += spreads[i];
-   mean /= (double)Z_Lookback;
-
-   double variance = 0;
-   for(int i = 0; i < Z_Lookback; i++)
-      variance += MathPow(spreads[i] - mean, 2);
-   double stdDev = MathSqrt(variance / (double)Z_Lookback);
-
-   // Current spread is the most-recent bar (index 0 = newest in CopyClose)
-   double currentSpread = spreads[0];
-   activePairs[pairIdx].zScore = (stdDev > EPS) ? (currentSpread - mean) / stdDev : 0.0;
   }
