@@ -1,0 +1,53 @@
+//@version=5
+indicator("Directional Volatility", shorttitle="DirVol", overlay=false)
+
+// --- Inputs ---
+int   len1       = input.int(9,   title="Fast Period",    minval=1)
+int   len2       = input.int(21,  title="Medium Period",  minval=1)
+int   len3       = input.int(50,  title="Slow Period",    minval=1)
+int   atrLen     = input.int(14,  title="ATR Length (Normalization)", minval=1)
+bool  useVolume  = input.bool(true, title="Volume-Weight TR")
+bool  useSigned  = input.bool(true, title="Directional (Signed) TR")
+bool  normalize  = input.bool(true, title="Normalize by ATR")
+
+// --- Signed TR (direction of candle body, fallback to close-vs-prev-close for flat/doji candles) ---
+float bodySign  = math.sign(close - open)
+float gapSign   = math.sign(close - close[1])  // fallback: direction of the gap or prior close
+float bodyDir   = bodySign != 0 ? bodySign : gapSign  // avoid zeroing out flat candles
+float rawTR     = ta.tr(true)
+float dTR       = useSigned ? rawTR * bodyDir : rawTR
+
+// --- Volume weighting ---
+float vwTR = useVolume ? dTR * volume : dTR
+
+// --- Cumulative sums ---
+float sum1 = math.sum(vwTR, len1)
+float sum2 = math.sum(vwTR, len2)
+float sum3 = math.sum(vwTR, len3)
+
+// --- Differences (momentum of directional vol) ---
+float d1 = sum2 - sum1
+float d2 = sum3 - sum2
+
+// --- EV: second derivative ---
+float ev = d2 - d1
+
+// --- ATR Normalization (divide by ATR only; avoid volume in denominator to prevent gap blow-ups) ---
+float atr    = ta.atr(atrLen)
+float atrFloor = math.max(atr, syminfo.mintick * 10)  // floor to avoid division by near-zero
+float normEV = normalize ? ev / atrFloor : ev
+
+// --- Signal line ---
+float signal = ta.ema(normEV, 9)
+
+// --- Zero line ---
+hline(0, "Zero", color=color.gray, linestyle=hline.style_dashed)
+
+// --- Histogram (EV vs Signal) ---
+float hist = normEV - signal
+color histColor = hist >= 0 ? (hist > hist[1] ? color.teal  : color.new(color.teal, 50))
+                             : (hist < hist[1] ? color.red   : color.new(color.red, 50))
+
+plot(hist,    title="Histogram",    style=plot.style_histogram, color=histColor, linewidth=2)
+plot(normEV,  title="DirVol (EV)",  color=color.white,  linewidth=1)
+plot(signal,  title="Signal EMA",   color=color.orange, linewidth=1)
