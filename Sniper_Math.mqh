@@ -135,10 +135,16 @@ bool CalcMurreyLevelsForSymbol(string sym, double &mm_88, double &mm_48, double 
 void CalcMurreyLevels(int pairIdx)
   {
    string sym = activePairs[pairIdx].symbolA;
+   ENUM_TIMEFRAMES mmTf = (ENUM_TIMEFRAMES)MrMM_Timeframe;
+   datetime curBarTime = iTime(sym, mmTf, 0);
+   if(curBarTime == g_lastMmBarTime[pairIdx] && curBarTime > 0)
+      return;
+
    double mm88 = 0, mm48 = 0, mm08 = 0, mmInc = 0;
    double mmP28 = 0, mmP18 = 0, mmM18 = 0, mmM28 = 0;
    if(!CalcMurreyLevelsForSymbol(sym, mm88, mm48, mm08, mmInc, mmP28, mmP18, mmM18, mmM28))
       return;
+   g_lastMmBarTime[pairIdx] = curBarTime;
 
    // Log MM levels whenever they change (inc changes = new grid anchored)
    if(EnableLogging && MathAbs(mmInc - activePairs[pairIdx].mmIncrement) > EPS)

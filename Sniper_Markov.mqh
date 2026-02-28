@@ -54,10 +54,12 @@ struct MarkovContext
    int               prevState;
    int               prev2State;
    int               trendBars;
-   bool              hasSmoothed;
    double            smoothedChange;
-   double            transMat[MARKOV_ROWS][MARKOV_COLS];
+   bool              hasSmoothed;
+   double            volRatio;
+   bool              valid;
    double            rowTotals[MARKOV_ROWS];
+   double            transMat[MARKOV_ROWS][MARKOV_COLS];
    double            evMatrix[MARKOV_ROWS];
    double            pDown;
    double            pNeu;
@@ -67,8 +69,31 @@ struct MarkovContext
    double            expectedValue;
    double            edge;
    double            effectiveSamples;
-   bool              valid;
+  };
+
+// binary-safe structure for file I/O
+struct MarkovPersistentData
+  {
+   datetime          lastBarTime;
+   int               state;
+   int               prevState;
+   int               prev2State;
+   int               trendBars;
+   double            smoothedChange;
+   bool              hasSmoothed;
    double            volRatio;
+   bool              valid;
+   double            rowTotals[MARKOV_ROWS];
+   double            transMat[MARKOV_ROWS][MARKOV_COLS];
+   double            evMatrix[MARKOV_ROWS];
+   double            pDown;
+   double            pNeu;
+   double            pUp;
+   double            confidence;
+   double            entropyNorm;
+   double            expectedValue;
+   double            edge;
+   double            effectiveSamples;
   };
 
 MarkovConfig g_markovCfg;
@@ -187,8 +212,104 @@ int MarkovFindContext(const string symbol)
    return -1;
   }
 
+string MarkovGetFileName(const string symbol)
+  {
+   string sym = symbol;
+   StringReplace(sym, "/", "");
+   StringReplace(sym, "\\", "");
+   return "ZScoreMurreySniper\\Markov_" + sym + "_" + EnumToString(g_markovCfg.timeframe) + ".bin";
+  }
+
+void MarkovSaveToFile(const string symbol)
+  {
+   int idx = MarkovFindContext(symbol);
+   if(idx < 0)
+      return;
+
+   MarkovContext ctx = g_markovCtx[idx];
+   MarkovPersistentData data;
+   data.lastBarTime = ctx.lastBarTime;
+   data.state = ctx.state;
+   data.prevState = ctx.prevState;
+   data.prev2State = ctx.prev2State;
+   data.trendBars = ctx.trendBars;
+   data.smoothedChange = ctx.smoothedChange;
+   data.hasSmoothed = ctx.hasSmoothed;
+   data.volRatio = ctx.volRatio;
+   data.valid = ctx.valid;
+   ArrayCopy(data.rowTotals, ctx.rowTotals);
+   for(int r = 0; r < MARKOV_ROWS; r++)
+     {
+      for(int c = 0; c < MARKOV_COLS; c++)
+         data.transMat[r][c] = ctx.transMat[r][c];
+     }
+   ArrayCopy(data.evMatrix, ctx.evMatrix);
+   data.pDown = ctx.pDown;
+   data.pNeu = ctx.pNeu;
+   data.pUp = ctx.pUp;
+   data.confidence = ctx.confidence;
+   data.entropyNorm = ctx.entropyNorm;
+   data.expectedValue = ctx.expectedValue;
+   data.edge = ctx.edge;
+   data.effectiveSamples = ctx.effectiveSamples;
+
+   string path = MarkovGetFileName(symbol);
+   int file = FileOpen(path, FILE_WRITE | FILE_BIN);
+   if(file != INVALID_HANDLE)
+     {
+      FileWriteStruct(file, data);
+      FileClose(file);
+     }
+  }
+
+bool MarkovLoadFromFile(const string symbol, MarkovContext &ctx)
+  {
+   string path = MarkovGetFileName(symbol);
+   if(!FileIsExist(path))
+      return false;
+
+   int file = FileOpen(path, FILE_READ | FILE_BIN);
+   if(file == INVALID_HANDLE)
+      return false;
+
+   MarkovPersistentData data;
+   uint read = FileReadStruct(file, data);
+   FileClose(file);
+
+   if(read < sizeof(MarkovPersistentData))
+      return false;
+
+   ctx.lastBarTime = data.lastBarTime;
+   ctx.state = data.state;
+   ctx.prevState = data.prevState;
+   ctx.prev2State = data.prev2State;
+   ctx.trendBars = data.trendBars;
+   ctx.smoothedChange = data.smoothedChange;
+   ctx.hasSmoothed = data.hasSmoothed;
+   ctx.volRatio = data.volRatio;
+   ctx.valid = data.valid;
+   ArrayCopy(ctx.rowTotals, data.rowTotals);
+   for(int r = 0; r < MARKOV_ROWS; r++)
+     {
+      for(int c = 0; c < MARKOV_COLS; c++)
+         ctx.transMat[r][c] = data.transMat[r][c];
+     }
+   ArrayCopy(ctx.evMatrix, data.evMatrix);
+   ctx.pDown = data.pDown;
+   ctx.pNeu = data.pNeu;
+   ctx.pUp = data.pUp;
+   ctx.confidence = data.confidence;
+   ctx.entropyNorm = data.entropyNorm;
+   ctx.expectedValue = data.expectedValue;
+   ctx.edge = data.edge;
+   ctx.effectiveSamples = data.effectiveSamples;
+   
+   return true;
+  }
+
 void MarkovReleaseContext(MarkovContext &ctx)
   {
+   MarkovSaveToFile(ctx.symbol);
    if(ctx.atrHandle != INVALID_HANDLE)
       IndicatorRelease(ctx.atrHandle);
    if(ctx.macroHandle != INVALID_HANDLE)
@@ -225,7 +346,12 @@ int MarkovEnsureContext(const string symbol)
    g_markovCtx[idx].atrHandle = iATR(symbol, g_markovCfg.timeframe, g_markovCfg.atrLength);
    g_markovCtx[idx].macroHandle = iMA(symbol, g_markovCfg.timeframe, g_markovCfg.macroLen, 0, MODE_EMA, PRICE_CLOSE);
    g_markovCtx[idx].microHandle = iMA(symbol, g_markovCfg.timeframe, g_markovCfg.microLen, 0, MODE_EMA, PRICE_CLOSE);
-   MarkovResetContext(g_markovCtx[idx]);
+   
+   if(!MarkovLoadFromFile(symbol, g_markovCtx[idx]))
+      MarkovResetContext(g_markovCtx[idx]);
+   else
+      g_markovCtx[idx].initialized = true;
+
    return idx;
   }
 

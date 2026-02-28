@@ -31,6 +31,8 @@ struct SequenceState
    double            trailSL;
    double            lpTriggerDist;
    double            lpTrailDist;
+   ulong             tickets[100];   // Performance: cached tickets for fast trailing
+   int               ticketCount;
   };
 
 class CSequenceManager
@@ -66,6 +68,8 @@ public:
          m_sequences[i].trailSL = 0;
          m_sequences[i].lpTriggerDist = 0;
          m_sequences[i].lpTrailDist = 0;
+         m_sequences[i].ticketCount = 0;
+         ArrayInitialize(m_sequences[i].tickets, 0);
         }
      }
 
@@ -85,9 +89,10 @@ public:
       m_sequences[seqIdx].lowestPrice = 0;
       m_sequences[seqIdx].highestPrice = 0;
       m_sequences[seqIdx].avgPrice = 0;
+      m_sequences[seqIdx].ticketCount = 0;
      }
 
-   void              AccumulatePosition(int seqIdx, double lots, double openPrice, double pl, int side)
+   void              AccumulatePosition(int seqIdx, double lots, double openPrice, double pl, int side, ulong ticket)
      {
       if(seqIdx < 0 || seqIdx >= MAX_PAIRS * 2)
          return;
@@ -104,6 +109,12 @@ public:
          m_sequences[seqIdx].lowestPrice = openPrice;
       if(m_sequences[seqIdx].highestPrice == 0 || openPrice > m_sequences[seqIdx].highestPrice)
          m_sequences[seqIdx].highestPrice = openPrice;
+       
+       if(m_sequences[seqIdx].ticketCount < 100)
+       {
+          m_sequences[seqIdx].tickets[m_sequences[seqIdx].ticketCount] = ticket;
+          m_sequences[seqIdx].ticketCount++;
+       }
      }
 
    void              FinalizeSequence(int seqIdx)
@@ -148,6 +159,8 @@ public:
       m_sequences[seqIdx].tradeSymbol = "";
       m_sequences[seqIdx].lpTriggerDist = 0;
       m_sequences[seqIdx].lpTrailDist = 0;
+      m_sequences[seqIdx].ticketCount = 0;
+      ArrayInitialize(m_sequences[seqIdx].tickets, 0);
      }
   };
 

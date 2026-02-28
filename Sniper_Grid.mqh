@@ -344,6 +344,7 @@ bool OpenOrderWithLots(int seqIdx, ENUM_ORDER_TYPE orderType, string symbol, dou
          if(sequences[seqIdx].highestPrice == 0 || price > sequences[seqIdx].highestPrice) sequences[seqIdx].highestPrice = price;
          if(sequences[seqIdx].lowestPrice == 0 || price < sequences[seqIdx].lowestPrice) sequences[seqIdx].lowestPrice = price;
         }
+      g_lastPositionsTotal = -1; // Force ScanPositions on next tick
      }
    return result;
   }
@@ -412,7 +413,11 @@ bool OpenBreakoutOrder(int boIdx, ENUM_ORDER_TYPE orderType, string symbol, doub
    trade.SetTypeFilling(ResolveFillingMode(symbol));
    string comment = "ZSM-BO-" + IntegerToString(orderType == ORDER_TYPE_BUY ? 0 : 1);
    bool ok = TryOpenPositionWithRetry(symbol, orderType, lots, entryRef, sl, tp, comment);
-   if(ok) breakoutLastEntryTime[boIdx] = TimeCurrent();
+   if(ok) 
+     {
+      breakoutLastEntryTime[boIdx] = TimeCurrent();
+      g_lastPositionsTotal = -1; // Force ScanPositions on next tick
+     }
    return ok;
   }
 
@@ -432,6 +437,7 @@ void CloseSequence(int seqIdx, string reason)
          if(!TryClosePositionWithRetry(ticket)) closeFailed = true;
         }
      }
+   if(!closeFailed) g_lastPositionsTotal = -1; // Force ScanPositions on next tick
   }
 
 bool CloseBreakoutPositions(string reason)
@@ -472,14 +478,7 @@ void CloseAll(string reason)
 //+------------------------------------------------------------------+
 int TotalManagedPositions()
   {
-   int cnt = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      if(PositionGetTicket(i) == 0) continue;
-      string comment = PositionGetString(POSITION_COMMENT);
-      if(IsManagedPositionComment(comment) || StringFind(comment, "ZSHEDGE") == 0) cnt++;
-     }
-   return cnt;
+   return g_cachedTotalManagedPositions;
   }
 
 int TotalPositions() { return TotalManagedPositions(); }

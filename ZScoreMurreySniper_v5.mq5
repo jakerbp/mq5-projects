@@ -97,6 +97,10 @@ struct ActivePair
    int               sellSeqIdx;
    datetime          lastBuySeqCloseTime;
    datetime          lastSellSeqCloseTime;
+   datetime          trendBreachTimeBuy;
+   datetime          trendBreachTimeSell;
+   double            trendBreachPriceBuy;
+   double            trendBreachPriceSell;
   };
 
 struct CorrPair
@@ -139,12 +143,12 @@ input group "~~~~~~~~~General Settings~~~~~~~~~";
 input long    MAGIC_NUMBER = 20250215;             // Magic Number
 input group "#### Scanner & Symbol Selection ####";
 input string  Trade_Symbols = "EURUSD,GBPUSD,AUDUSD,NZDUSD,USDJPY,USDCAD,USDCHF,EURJPY,GBPJPY,EURGBP"; // Symbols
-input int     Max_Pairs = 3;                        // Max Active Pairs
+input int     Max_Active_Symbols = 3;               // Max Active Symbols (Portfolio)
 input int     Scanner_IntervalHours = 4;            // Rescan Interval (hours)
 input bool    UseCurrencyStrengthMatrix = false;    // Use Currency Strength Matrix
 input enumTf  StrengthTimeframe = tfD1;             // Strength Timeframe
 input int     StrengthLookbackBars = 5;             // Strength Lookback (bars on StrengthTimeframe)
-input int     StrengthExtremeCount = 1;             // Strongest/Weakest Buckets (1-2)
+input double  StrengthExtremePercent = 25.0;        // Strongest/Weakest Percent (0-100)
 input ENUM_DECISION_MODE DecisionMode = decisionLegacyParity; // Legacy parity or ranked deterministic
 input ENUM_STRATEGY_TIEBREAK StrategyTieBreak = stratTrendFirst; // Strategy priority when capped
 input ENUM_SIDE_TIEBREAK SideTieBreak = sideBuyFirst; // Side priority when capped
@@ -195,6 +199,7 @@ input double  TrendMaxLots = 1.0;                   // Trend Max Lots Per Order
 input double  TrendRiskPercent = 0;                 // Trend Risk % (0=use TrendLotSizeBase)
 input double  TrendLockProfitTriggerPips = 0;       // Trend Lock Profit Trigger (pips, neg=ATR/Keltner mult)
 input double  TrendTrailingStop = 5.0;              // Trend Trailing Stop (pips, neg=ATR/Keltner mult)
+input int     Trend_RetestWindow_Bars = 60;          // Retest Window (Bars)
 input int     TrendLockProfitMinTrades = 0;         // Trend Min Trades for Lock Profit
 input enumTrailFrequency TrendLockProfitCheckFrequency = trailEveryTick; // Trend Lock Trigger Check Frequency
 input enumTrailFrequency TrendTrailFrequency = trailEveryTick; // Trend Trailing SL Update Frequency
@@ -214,7 +219,7 @@ input int     MaxDailyLosers = 0;                    // Max Daily Losers (0=off)
 input enumRestart MaxSequencesRestartEa = restartNextDay; // Restart After Max
 
 //input group "#### MM Levels ####";
-const enumEntryPriceType EntryPriceType = entryOnClose; // Entry Source (Close/Tick)
+const enumEntryPriceType EntryPriceType = entryOnTick; // Entry Source (Close/Tick)
 
 input group "#### Range Settings ####";
 input enumTf  ATRtimeframe = tfH1;                  // ATR Timeframe
@@ -287,8 +292,8 @@ input double  ProfitCloseEquityAmount = 0;           // Daily Profit Target (0=o
 input enumRestart RestartEaAfterLoss = restartNextDay; // Restart After Loss
 input string  TimeOfRestart_Equity = "01:00";        // Restart Time
 input int     RestartInHours = 0;                    // Restart In Hours
-input bool    RescueCloseInDrawdown = false;         // Close In Drawdown If Net Profit
 input double  RescueDrawdownThreshold = 0;           // Rescue DD Threshold $ (0=off)
+input double  RescueNetProfitTarget = 0;             // Rescue Net Profit Target $
 
 input group "#### Weekend Closure ####";
 input bool    CloseAllTradesDisableEA = false;       // Close All Friday
@@ -345,6 +350,17 @@ double  StagnationUnwindNetThreshold = 0.0;
 //+------------------------------------------------------------------+
 //|  NEWS DATA INCLUDE                                               |
 //+------------------------------------------------------------------+
+// --- Performance Cache ---
+int      g_cachedTotalManagedPositions = 0;
+int      g_cachedActiveManagedSequences = 0;
+uint     g_lastDashboardUpdate         = 0;
+uint     g_lastChartLinesUpdate        = 0;
+int      g_lastPositionsTotal          = 0;
+datetime g_lastMmBarTime[MAX_PAIRS];
+// Symbol Tick Cache
+string   g_tickCacheSymbols[MAX_SYMBOLS + 50];
+MqlTick  g_tickCacheTicks[MAX_SYMBOLS + 50];
+int      g_tickCacheCount = 0;
 #include "hvzone_news_data.mqh"
 
 //+------------------------------------------------------------------+
@@ -435,6 +451,22 @@ bool     IsTester, IsVisual;
 // Equity series for R² curve-quality score in OnTester (populated each new bar, tester only)
 double   g_equitySeries[];
 int      g_equityCount = 0;
+
+struct SymFloatingEquity
+  {
+   string symbol;
+   int trades;
+   double closedProfit;
+   double grossProfit;
+   double grossLoss;
+   double peakEquity;
+   double maxDrawdown;
+   double equitySamples[]; 
+   int    sampleCount;
+  };
+SymFloatingEquity g_symEquityTracker[];
+int g_symEquityTrackerCount = 0;
+int g_symEquityLastDealsTotal = 0;
 
 // Counters
 int      sequenceCounter = 0, sequenceCounterWinners = 0, sequenceCounterLosers = 0;
@@ -1550,11 +1582,8 @@ bool IsTrendStrengthQualified(const string symbol, const int side)
    int rQuote = StrengthRankOf(quote);
    if(rBase < 0 || rQuote < 0)
       return false;
-   int ext = StrengthExtremeCount;
-   if(ext < 1)
-      ext = 1;
-   if(ext > 2)
-      ext = 2;
+   int ext = (int)MathRound(strengthCcyCount * StrengthExtremePercent / 100.0);
+   if(ext < 1) ext = 1;
    bool baseStrong = (rBase <= ext - 1);
    bool baseWeak = (rBase >= strengthCcyCount - ext);
    bool quoteStrong = (rQuote <= ext - 1);
@@ -1576,11 +1605,8 @@ bool IsRangeStrengthQualified(const string symbol)
    int rQuote = StrengthRankOf(quote);
    if(rBase < 0 || rQuote < 0)
       return false;
-   int ext = StrengthExtremeCount;
-   if(ext < 1)
-      ext = 1;
-   if(ext > 2)
-      ext = 2;
+   int ext = (int)MathRound(strengthCcyCount * StrengthExtremePercent / 100.0);
+   if(ext < 1) ext = 1;
    int lo = ext;
    int hi = strengthCcyCount - ext - 1;
    if(hi < lo)
@@ -1824,6 +1850,30 @@ string GetSequenceTradeSymbol(int seqIdx, int pairIdx)
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
+void ClearTickCache() { g_tickCacheCount = 0; }
+bool GetCachedTick(string symbol, MqlTick &tick)
+  {
+   for(int i = 0; i < g_tickCacheCount; i++)
+     {
+      if(g_tickCacheSymbols[i] == symbol)
+        {
+         tick = g_tickCacheTicks[i];
+         return true;
+        }
+     }
+   if(SymbolInfoTick(symbol, tick))
+     {
+      if(g_tickCacheCount < MAX_SYMBOLS + 50)
+        {
+         g_tickCacheSymbols[g_tickCacheCount] = symbol;
+         g_tickCacheTicks[g_tickCacheCount] = tick;
+         g_tickCacheCount++;
+        }
+      return true;
+     }
+   return false;
+  }
+
 int FindEntryBarCacheIndex(string symbol)
   {
    for(int i = 0; i < ArraySize(entryBarCacheSymbols); i++)
@@ -1960,14 +2010,20 @@ void MaybeUpdateLockProfitChartLines()
   {
    if(IsTester && !IsVisual)
       return;
+   if(GetTickCount() - g_lastChartLinesUpdate < 1000 && !newBar)
+      return;
    UpdateLockProfitChartLines();
+   g_lastChartLinesUpdate = GetTickCount();
   }
 
 void MaybeDrawDashboard()
   {
    if(IsTester && !IsVisual)
       return;
+   if(GetTickCount() - g_lastDashboardUpdate < 1000 && !newBar)
+      return;
    DrawDashboard();
+   g_lastDashboardUpdate = GetTickCount();
   }
 
 void InvalidateTickPositionSnapshot()
@@ -2107,14 +2163,17 @@ bool ReadEntryBarPrices(string symbol, double &downCrossPrice, double &upCrossPr
    downCrossPrice = ResolveEntryBarPrice(lastClose, lastHigh, lastLow, SIDE_BUY);
    upCrossPrice = ResolveEntryBarPrice(lastClose, lastHigh, lastLow, SIDE_SELL);
    symDigits = entryBarCacheDigits[cIdx];
-   double bidLocal = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double askLocal = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double pointLocal = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   closePriceOut = lastClose;
-   if(pointLocal <= 0)
-      return false;
-   symSpread = (askLocal - bidLocal) / pointLocal;
-   return true;
+    MqlTick tick;
+    if(!GetCachedTick(symbol, tick))
+       return false;
+    double bidLocal = tick.bid;
+    double askLocal = tick.ask;
+    double pointLocal = SymbolInfoDouble(symbol, SYMBOL_POINT);
+    closePriceOut = lastClose;
+    if(pointLocal <= 0)
+       return false;
+    symSpread = (askLocal - bidLocal) / pointLocal;
+    return true;
   }
 
 //+------------------------------------------------------------------+
@@ -2436,9 +2495,7 @@ bool HasOpenBreakoutPositionOnSymbol(string symbol)
    return false;
   }
 
-//+------------------------------------------------------------------+
-//|  PEARSON CORRELATION                                             |
-//+------------------------------------------------------------------+
+
 
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -2479,42 +2536,70 @@ bool TryDetectUniqueOpenSeqMagicForSymbolSide(string symbol, long posType, long 
 //+------------------------------------------------------------------+
 void RunScanner()
   {
-   if(numSymbols < 2)
+   if(numSymbols < 1)
       return;
+   ClearMurreyMemoCache();
+   ArrayInitialize(g_lastMmBarTime, 0);
    RefreshTickPositionSnapshot(true);
 
-// Generate candidate combinations.
-   int maxCombos = (numSymbols * (numSymbols - 1) / 2);
+// Generate candidates (single symbols).
+   int numCombos = numSymbols;
    CorrPair combos[];
-   ArrayResize(combos, maxCombos);
-   int numCombos = 0;
-
+   ArrayResize(combos, numCombos);
    for(int i = 0; i < numSymbols; i++)
      {
-      for(int j = i + 1; j < numSymbols; j++)
+      double score = 1.0;
+      if(UseCurrencyStrengthMatrix)
         {
-         combos[numCombos].idxA = i;
-         combos[numCombos].idxB = j;
-         combos[numCombos].score = 1.0;
-         numCombos++;
+         string base = GetBaseCurrency(allSymbols[i]);
+         string quote = GetQuoteCurrency(allSymbols[i]);
+         int rBase = StrengthRankOf(base);
+         int rQuote = StrengthRankOf(quote);
+         if(rBase >= 0 && rQuote >= 0)
+           {
+            // Score based on distance between currencies (higher = stronger trend candidate)
+            score = MathAbs(strengthScores[StrengthFindCurrencyIndex(base)] - strengthScores[StrengthFindCurrencyIndex(quote)]);
+           }
+        }
+      combos[i].idxA = i;
+      combos[i].idxB = i; // Solo symbol mode
+      combos[i].score = score;
+     }
+
+   // Sort candidates by score descending if strength is active
+   if(UseCurrencyStrengthMatrix)
+     {
+      for(int a = 0; a < numCombos - 1; a++)
+        {
+         int best = a;
+         for(int b = a + 1; b < numCombos; b++)
+           {
+            if(combos[b].score > combos[best].score)
+               best = b;
+           }
+         if(best != a)
+           {
+            CorrPair tmp = combos[a];
+            combos[a] = combos[best];
+            combos[best] = tmp;
+           }
         }
      }
-   ArrayResize(combos, numCombos);
 
    ActivePair newPairs[];
    ArrayResize(newPairs, 0);
    int selected = 0;
 
-   for(int i = 0; i < numCombos && selected < Max_Pairs && selected < MAX_PAIRS; i++)
+   for(int i = 0; i < numCombos && selected < Max_Active_Symbols && selected < MAX_PAIRS; i++)
      {
       string sA = allSymbols[combos[i].idxA];
       string sB = allSymbols[combos[i].idxB];
-      // Scanner-level filter: no duplicate symbols across pairs
+
+      // Scanner-level filter: no duplicate symbols (obvious for solo)
       bool symbolUsed = false;
       for(int j = 0; j < selected; j++)
         {
-         if(newPairs[j].symbolA == sA || newPairs[j].symbolB == sA ||
-            newPairs[j].symbolA == sB || newPairs[j].symbolB == sB)
+         if(newPairs[j].symbolA == sA)
            {
             symbolUsed = true;
             break;
@@ -2555,6 +2640,8 @@ void RunScanner()
          newPairs[selected].entry_mm_plus28 = 0;
          newPairs[selected].lastBuySeqCloseTime = 0;
          newPairs[selected].lastSellSeqCloseTime = 0;
+         newPairs[selected].trendBreachTimeBuy = 0;
+         newPairs[selected].trendBreachTimeSell = 0;
         }
       // Update fields that may change on rescan
       if(carried)
@@ -2567,7 +2654,7 @@ void RunScanner()
       selected++;
 
       if(EnableLogging)
-         Print("[Scanner] Selected: ", sA, " vs ", sB,
+         Print("[Scanner] Selected: ", sA,
                " score=", DoubleToString(combos[i].score, 3),
                carried ? " (state preserved)" : " (new)");
      }
@@ -2657,6 +2744,8 @@ void RunScanner()
       newPairs[selected].entry_mm_plus28 = 0;
       newPairs[selected].lastBuySeqCloseTime = 0;
       newPairs[selected].lastSellSeqCloseTime = 0;
+      newPairs[selected].trendBreachTimeBuy = 0;
+      newPairs[selected].trendBreachTimeSell = 0;
       selected++;
       if(EnableLogging)
          Print("[Scanner] Recovery: added managed-only symbol ", posSymbol, " with open positions");
@@ -2706,12 +2795,12 @@ void RunScanner()
 
       if(oldBuyIdx >= 0)
         {
-         // EXISTING PAIR: Preserve state and magic number
+         // EXISTING: Preserve state and magic number
          tempSequences[newBuyIdx] = g_seqMgr.m_sequences[oldBuyIdx];
          tempSequences[newSellIdx] = g_seqMgr.m_sequences[oldSellIdx];
          if(EnableLogging)
            {
-            Print("[ScannerMap] Carry pair ", newPairs[i].symbolA, "/", newPairs[i].symbolB,
+            Print("[ScannerMap] Carry symbol ", newPairs[i].symbolA,
                   " -> buyMagic=", tempSequences[newBuyIdx].magicNumber,
                   " sellMagic=", tempSequences[newSellIdx].magicNumber);
            }
@@ -2750,9 +2839,9 @@ void RunScanner()
              tempSequences[newSellIdx].magicNumber = recoveredSellMagic;
           else
              tempSequences[newSellIdx].magicNumber = AllocateUnusedSequenceMagic();
-         if(EnableLogging)
+          if(EnableLogging)
            {
-            Print("[ScannerMap] New pair ", newPairs[i].symbolA, "/", newPairs[i].symbolB,
+            Print("[ScannerMap] New symbol ", newPairs[i].symbolA,
                   " recovery=", (newPairs[i].recoveryManagedOnly ? "true" : "false"),
                   " -> buyMagic=", tempSequences[newBuyIdx].magicNumber,
                   " sellMagic=", tempSequences[newSellIdx].magicNumber);
@@ -2833,7 +2922,7 @@ void RunScanner()
    MarkSequenceMagicCacheDirty();
 
    lastScanTime = TimeCurrent();
-   Print("[Scanner] Active portfolio: ", numActivePairs, " pairs mode=PearsonOnly");
+   Print("[Scanner] Active portfolio: ", numActivePairs, " symbols mode=PortfolioTrader");
   }
 
 //+------------------------------------------------------------------+
@@ -2850,8 +2939,16 @@ void RunScanner()
 //+------------------------------------------------------------------+
 void ScanPositions()
   {
-   RefreshTickPositionSnapshot(true);
+   // 1. Reset Performance Counters
+   g_cachedTotalManagedPositions = 0;
+   g_cachedActiveManagedSequences = 0;
+   bool seqIsActive[MAX_PAIRS * 2];
+   ArrayInitialize(seqIsActive, false);
 
+   // 2. Refresh Snapshot (smart refresh)
+   RefreshTickPositionSnapshot(false);
+
+   // 3. Reset Sequence Metrics
    for(int i = 0; i < MAX_PAIRS * 2; i++)
      {
       g_seqMgr.m_sequences[i].prevTradeCount = g_seqMgr.m_sequences[i].tradeCount;
@@ -2868,11 +2965,16 @@ void ScanPositions()
       breakoutSide[i] = -1;
      }
 
+   // 4. Main Scanning Loop
    for(int i = 0; i < ArraySize(tickPosRows); i++)
      {
       string posComment = tickPosRows[i].comment;
       if(!IsManagedPositionComment(posComment))
          continue;
+      
+      // Increment total managed count
+      g_cachedTotalManagedPositions++;
+
       long magic = tickPosRows[i].magic;
       string posSymbol = tickPosRows[i].symbol;
       double posProfit = tickPosRows[i].profit + tickPosRows[i].swap + tickPosRows[i].commission;
@@ -2890,34 +2992,23 @@ void ScanPositions()
          continue;
         }
 
-      int seqIdx = -1;
-      for(int p = 0; p < numActivePairs; p++)
-        {
-         if(magic == g_seqMgr.m_sequences[activePairs[p].buySeqIdx].magicNumber)
-            seqIdx = activePairs[p].buySeqIdx;
-         else
-            if(magic == g_seqMgr.m_sequences[activePairs[p].sellSeqIdx].magicNumber)
-               seqIdx = activePairs[p].sellSeqIdx;
-         if(seqIdx >= 0)
-            break;
-        }
-      if(seqIdx < 0)
-        {
-         for(int s = 0; s < MAX_PAIRS * 2; s++)
-           {
-            if(magic == g_seqMgr.m_sequences[s].magicNumber)
-              {
-               seqIdx = s;
-               break;
-              }
-           }
-        }
+      // Fast Magic Lookup
+      int seqIdx = FindSequenceByMagic(magic);
+
       if(seqIdx < 0)
         {
          if(EnableLogging)
             Print("[SCAN_MISS] No seq for magic=", magic, " sym=", posSymbol, " comment=", posComment);
          continue;
         }
+
+      // Count unique active MR sequences
+      if(!seqIsActive[seqIdx])
+        {
+         seqIsActive[seqIdx] = true;
+         g_cachedActiveManagedSequences++;
+        }
+
       if(StringLen(g_seqMgr.m_sequences[seqIdx].tradeSymbol) == 0)
          g_seqMgr.m_sequences[seqIdx].tradeSymbol = posSymbol;
 
@@ -2925,22 +3016,19 @@ void ScanPositions()
       double posPrice = tickPosRows[i].openPrice;
 
       g_seqMgr.AccumulatePosition(seqIdx, posLots, posPrice, posProfit,
-                                  (posType == POSITION_TYPE_BUY) ? SIDE_BUY : SIDE_SELL);
+                                  (posType == POSITION_TYPE_BUY) ? SIDE_BUY : SIDE_SELL,
+                                  tickPosRows[i].ticket);
 
-      // Preserve strategy tag unless the comment explicitly encodes it.
-      // Historical builds used "ZSM" for managed trades (both MR and Trend),
-      // so forcing MR here can incorrectly remap Trend sequences on every scan.
+      // Preserve strategy tag based on comment
       if(StringFind(posComment, "ZSM-TREND") == 0 || StringFind(posComment, "ZSM-TR") == 0)
          g_seqMgr.m_sequences[seqIdx].strategyType = STRAT_TRENDING;
       else if(StringFind(posComment, "ZSM-MR") == 0)
          g_seqMgr.m_sequences[seqIdx].strategyType = STRAT_MEAN_REVERSION;
-      // else: plain "ZSM" from older builds — leave strategyType unchanged (preserves runtime tag)
 
       if(EnableLogging)
          Print("[STRAT_TAG] ", posSymbol, " magic=", magic,
                " comment=", posComment,
                " strategy=", (g_seqMgr.m_sequences[seqIdx].strategyType == STRAT_TRENDING ? "TREND" : "MR"));
-
      }
 
    for(int i = 0; i < MAX_PAIRS * 2; i++)
@@ -3219,7 +3307,7 @@ void CloseSequencesByStrategy(const ENUM_STRATEGY_TYPE strat, const string reaso
 //+------------------------------------------------------------------+
 //|  TRAILING / LOCK PROFIT (Murrey-level based)                     |
 //+------------------------------------------------------------------+
-void TrailingForSequence(int seqIdx, int pairIdx)
+void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double currentAsk)
   {
    if(g_seqMgr.m_sequences[seqIdx].tradeCount == 0)
       return;
@@ -3254,8 +3342,9 @@ void TrailingForSequence(int seqIdx, int pairIdx)
       if(effTSL <= 0)
          return;
 
-      double curBid = SymbolInfoDouble(sym, SYMBOL_BID);
-      double curAsk = SymbolInfoDouble(sym, SYMBOL_ASK);
+      // Use passed bid/ask
+      double curBid = currentBid;
+      double curAsk = currentAsk;
 
       if(side == SIDE_BUY)
         {
@@ -3274,19 +3363,17 @@ void TrailingForSequence(int seqIdx, int pairIdx)
             double validSL = 0;
             if(!PrepareValidStopForModify(sym, SIDE_BUY, newSL, validSL))
                return;
-            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            for(int k = 0; k < g_seqMgr.m_sequences[seqIdx].ticketCount; k++)
               {
-               if(PositionGetTicket(i) == 0)
-                  continue;
-               if(PositionGetInteger(POSITION_MAGIC) != magic)
-                  continue;
-               if(PositionGetString(POSITION_SYMBOL) != sym)
-                  continue;
-               double curSL = PositionGetDouble(POSITION_SL);
-               if(validSL > curSL || curSL == 0)
+               ulong ticket = g_seqMgr.m_sequences[seqIdx].tickets[k];
+               if(PositionSelectByTicket(ticket))
                  {
-                  trade.SetExpertMagicNumber(magic);
-                  trade.PositionModify(PositionGetInteger(POSITION_TICKET), validSL, PositionGetDouble(POSITION_TP));
+                  double curSL = PositionGetDouble(POSITION_SL);
+                  if(validSL > curSL || curSL == 0)
+                    {
+                     trade.SetExpertMagicNumber(magic);
+                     trade.PositionModify(ticket, validSL, PositionGetDouble(POSITION_TP));
+                    }
                  }
               }
            }
@@ -3308,19 +3395,17 @@ void TrailingForSequence(int seqIdx, int pairIdx)
             double validSL = 0;
             if(!PrepareValidStopForModify(sym, SIDE_SELL, newSL, validSL))
                return;
-            for(int i = PositionsTotal() - 1; i >= 0; i--)
+            for(int k = 0; k < g_seqMgr.m_sequences[seqIdx].ticketCount; k++)
               {
-               if(PositionGetTicket(i) == 0)
-                  continue;
-               if(PositionGetInteger(POSITION_MAGIC) != magic)
-                  continue;
-               if(PositionGetString(POSITION_SYMBOL) != sym)
-                  continue;
-               double curSL = PositionGetDouble(POSITION_SL);
-               if(validSL < curSL || curSL == 0)
+               ulong ticket = g_seqMgr.m_sequences[seqIdx].tickets[k];
+               if(PositionSelectByTicket(ticket))
                  {
-                  trade.SetExpertMagicNumber(magic);
-                  trade.PositionModify(PositionGetInteger(POSITION_TICKET), validSL, PositionGetDouble(POSITION_TP));
+                  double curSL = PositionGetDouble(POSITION_SL);
+                  if(validSL < curSL || curSL == 0)
+                    {
+                     trade.SetExpertMagicNumber(magic);
+                     trade.PositionModify(ticket, validSL, PositionGetDouble(POSITION_TP));
+                    }
                  }
               }
            }
@@ -3987,10 +4072,6 @@ bool CheckStopOfEA()
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
-
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
 bool IsOurDeal(ulong dealTicket)
   {
    long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
@@ -4387,13 +4468,7 @@ bool SequenceHasLiveManagedPositions(int seqIdx, string symbol = "")
 //+------------------------------------------------------------------+
 int CountOpenMrSequences()
   {
-   int cnt = 0;
-   for(int i = 0; i < MAX_PAIRS * 2; i++)
-     {
-      if(g_seqMgr.m_sequences[i].tradeCount > 0 || SequenceHasLiveManagedPositions(i))
-         cnt++;
-     }
-   return cnt;
+   return g_cachedActiveManagedSequences;
   }
 
 //+------------------------------------------------------------------+
@@ -5861,15 +5936,136 @@ void RunBreakoutEntryEngine()
   }
 
 //+------------------------------------------------------------------+
+//|  Update per-symbol floating equity samples (Tester Only)         |
+//+------------------------------------------------------------------+
+void UpdateSymbolEquitySamples()
+  {
+   if(!HistorySelect(0, TimeCurrent())) return;
+   
+   int currentDeals = HistoryDealsTotal();
+   for(int i = g_symEquityLastDealsTotal; i < currentDeals; i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      long dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL) continue;
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT)
+        {
+         string sym = HistoryDealGetString(ticket, DEAL_SYMBOL);
+         if(sym == "") continue;
+         double pl = HistoryDealGetDouble(ticket, DEAL_PROFIT) + HistoryDealGetDouble(ticket, DEAL_COMMISSION) + HistoryDealGetDouble(ticket, DEAL_SWAP);
+         
+         int idx = -1;
+         for(int j=0; j<g_symEquityTrackerCount; j++)
+           {
+            if(g_symEquityTracker[j].symbol == sym) { idx = j; break; }
+           }
+         if(idx < 0)
+           {
+            idx = g_symEquityTrackerCount;
+            g_symEquityTrackerCount++;
+            ArrayResize(g_symEquityTracker, g_symEquityTrackerCount);
+            g_symEquityTracker[idx].symbol = sym;
+            g_symEquityTracker[idx].trades = 0;
+            g_symEquityTracker[idx].closedProfit = 0;
+            g_symEquityTracker[idx].grossProfit = 0;
+            g_symEquityTracker[idx].grossLoss = 0;
+            g_symEquityTracker[idx].maxDrawdown = 0;
+            g_symEquityTracker[idx].peakEquity = 0;
+            g_symEquityTracker[idx].sampleCount = 0;
+            ArrayResize(g_symEquityTracker[idx].equitySamples, 100);
+           }
+           
+         g_symEquityTracker[idx].closedProfit += pl;
+         if(pl > 0.0) g_symEquityTracker[idx].grossProfit += pl;
+         else if(pl < 0.0) g_symEquityTracker[idx].grossLoss += MathAbs(pl);
+         g_symEquityTracker[idx].trades++;
+        }
+     }
+   g_symEquityLastDealsTotal = currentDeals;
+
+   double floatingPL[];
+   ArrayResize(floatingPL, g_symEquityTrackerCount);
+   ArrayInitialize(floatingPL, 0.0);
+   
+   int totalPos = PositionsTotal();
+   for(int i=0; i<totalPos; i++)
+     {
+      ulong posTicket = PositionGetTicket(i);
+      if(posTicket > 0)
+        {
+         string sym = PositionGetString(POSITION_SYMBOL);
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         if(magic != 0) // Track all positions with a magic number from our EA
+           {
+            double pl = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+            int idx = -1;
+            for(int j=0; j<g_symEquityTrackerCount; j++)
+              {
+               if(g_symEquityTracker[j].symbol == sym) { idx = j; break; }
+              }
+            if(idx < 0)
+              {
+               idx = g_symEquityTrackerCount;
+               g_symEquityTrackerCount++;
+               ArrayResize(g_symEquityTracker, g_symEquityTrackerCount);
+               ArrayResize(floatingPL, g_symEquityTrackerCount);
+               floatingPL[idx] = 0; 
+               g_symEquityTracker[idx].symbol = sym;
+               g_symEquityTracker[idx].trades = 0;
+               g_symEquityTracker[idx].closedProfit = 0;
+               g_symEquityTracker[idx].grossProfit = 0;
+               g_symEquityTracker[idx].grossLoss = 0;
+               g_symEquityTracker[idx].maxDrawdown = 0;
+               g_symEquityTracker[idx].peakEquity = 0;
+               g_symEquityTracker[idx].sampleCount = 0;
+               ArrayResize(g_symEquityTracker[idx].equitySamples, 100);
+              }
+            floatingPL[idx] += pl;
+           }
+        }
+     }
+     
+   for(int j=0; j<g_symEquityTrackerCount; j++)
+     {
+      double currentEquity = g_symEquityTracker[j].closedProfit + floatingPL[j];
+      
+      int sc = g_symEquityTracker[j].sampleCount;
+      int cap = ArraySize(g_symEquityTracker[j].equitySamples);
+      if(sc >= cap)
+         ArrayResize(g_symEquityTracker[j].equitySamples, cap + 1000); 
+         
+      g_symEquityTracker[j].equitySamples[sc] = currentEquity;
+      g_symEquityTracker[j].sampleCount++;
+      
+      if(currentEquity > g_symEquityTracker[j].peakEquity)
+         g_symEquityTracker[j].peakEquity = currentEquity;
+         
+      double dd = g_symEquityTracker[j].peakEquity - currentEquity;
+      if(dd > g_symEquityTracker[j].maxDrawdown)
+         g_symEquityTracker[j].maxDrawdown = dd;
+     }
+  }
+
+//+------------------------------------------------------------------+
 //|  EXPERT TICK FUNCTION                                            |
 //+------------------------------------------------------------------+
 void OnTick()
   {
    CurTime = TimeCurrent();
    InvalidateTickPositionSnapshot();
+   ClearTickCache();
    TimeToStruct(CurTime, now);
    newBar = isNewBar();
    newBarM1 = isNewBarM1();
+
+   // Declare session variables in outer scope to fix compilation errors
+   bool mrSessionOpen = IsStrategySessionOpen(STRAT_MEAN_REVERSION);
+   bool trendSessionOpen = IsStrategySessionOpen(STRAT_TRENDING);
+   bool anyStrategySessionOpen = (mrSessionOpen && EnableMeanReversion) || (trendSessionOpen && EnableTrendingStrategy);
+   int totalPos = g_cachedTotalManagedPositions;
+
    if(newBar)
      {
       ClearEntryBarCache();
@@ -5884,16 +6080,24 @@ void OnTick()
             g_equitySeries[g_equityCount] = eq;
             g_equityCount++;
            }
+         UpdateSymbolEquitySamples();
         }
      }
 
 // Efficiency Early Exit: Skip computation if nothing to manage and no new bar to process
-   int totalPos = TotalManagedPositions();
-   bool mrSessionOpen = IsStrategySessionOpen(STRAT_MEAN_REVERSION);
-   bool trendSessionOpen = IsStrategySessionOpen(STRAT_TRENDING);
-   bool anyStrategySessionOpen = (mrSessionOpen && EnableMeanReversion) || (trendSessionOpen && EnableTrendingStrategy);
-   if(totalPos == 0 && !anyStrategySessionOpen && !newBar && !newBarM1)
-      return;
+   if(PositionsTotal() == 0)
+     {
+      g_cachedTotalManagedPositions = 0;
+      g_cachedActiveManagedSequences = 0;
+      totalPos = 0;
+      if(!newBar && !newBarM1)
+         return;
+     }
+   else
+     {
+      if(g_cachedTotalManagedPositions == 0 && !anyStrategySessionOpen && !newBar && !newBarM1)
+         return;
+     }
 
 // New day detection
    if(now.day != lastDay)
@@ -5933,23 +6137,18 @@ void OnTick()
      }
 
 // Scan positions across all pairs
-   if(totalPos > 0)
+   int currentTotalPos = PositionsTotal();
+   if(g_cachedTotalManagedPositions > 0 || currentTotalPos > 0)
      {
       ulong scanUsStart = EnablePerfTiming ? PerfNowUs() : 0;
-      bool shouldScanNow = false;
-      if(totalPos != lastScannedManagedPosTotal)
-         shouldScanNow = true;
-      else
-         if(newBar || newBarM1)
-            shouldScanNow = true;
-      if(!shouldScanNow && ShouldScanPositionsEveryTick())
-         shouldScanNow = true;
+      bool shouldScanNow = (currentTotalPos != g_lastPositionsTotal || newBar || newBarM1 || ShouldScanPositionsEveryTick());
 
       if(shouldScanNow)
         {
          ScanPositions();
-         lastScannedManagedPosTotal = totalPos;
+         g_lastPositionsTotal = currentTotalPos;
         }
+      totalPos = g_cachedTotalManagedPositions; // Update local tracker
       if(EnablePerfTiming)
          perfScanUsAcc += (PerfNowUs() - scanUsStart);
      }
@@ -5961,7 +6160,8 @@ void OnTick()
          g_seqMgr.m_sequences[i].prevTradeCount = g_seqMgr.m_sequences[i].tradeCount;
          g_seqMgr.ResetRuntimeMetrics(i);
         }
-      lastScannedManagedPosTotal = 0;
+      g_lastPositionsTotal = 0;
+      totalPos = 0;
      }
 
    // Keep lock-profit chart levels synchronized on every tick.
@@ -6080,19 +6280,20 @@ void OnTick()
      }
 
 // Global Rescue Logic
-   if(RescueCloseInDrawdown && RescueDrawdownThreshold > 0)
+   if(RescueDrawdownThreshold > 0)
      {
       double totalOpenPL = TotalPlOpen();
-      if(totalOpenPL > 0)
+      if(totalOpenPL >= RescueNetProfitTarget)
         {
          bool closedAny = false;
          for(int sq = 0; sq < MAX_PAIRS * 2; sq++)
            {
             if(g_seqMgr.m_sequences[sq].tradeCount > 0 && g_seqMgr.m_sequences[sq].plOpen <= -RescueDrawdownThreshold)
               {
-               AsyncCloseSequence(sq, "Rescue Close: Net PL " + DoubleToString(totalOpenPL, 2) +
-                                  " seq draw " + DoubleToString(g_seqMgr.m_sequences[sq].plOpen, 2));
+               AsyncCloseAll("Rescue Close ALL: Net PL " + DoubleToString(totalOpenPL, 2) +
+                             " (seq draw " + DoubleToString(g_seqMgr.m_sequences[sq].plOpen, 2) + ")");
                closedAny = true;
+               break;
               }
            }
          if(closedAny)
@@ -6201,6 +6402,13 @@ void OnTick()
          bool buyStartedNow = false;
          bool sellStartedNow = false;
 
+         // Get current bid/ask for symA using tick cache
+         MqlTick tickA;
+         if(!GetCachedTick(symA, tickA))
+            continue;
+         double curBidA = tickA.bid;
+         double curAskA = tickA.ask;
+
          // Track extreme market prices for sequence management
          if(g_seqMgr.m_sequences[bIdx].tradeCount > 0)
            {
@@ -6254,7 +6462,7 @@ void OnTick()
                doTrailBuy = true;
 
             if(doTrailBuy)
-               TrailingForSequence(bIdx, p);
+               TrailingForSequence(bIdx, p, curBidA, curAskA);
            }
 
          // SELL trailing
@@ -6273,7 +6481,7 @@ void OnTick()
                doTrailSell = true;
 
             if(doTrailSell)
-               TrailingForSequence(sIdx, p);
+               TrailingForSequence(sIdx, p, curBidA, curAskA);
            }
 
          // ---- ENTRIES: Only on new bar + session open ----
@@ -6394,9 +6602,10 @@ void OnTick()
                continue;
             bool scarceStartSlots = ((MaxOpenSequences > 0 && openMrSequenceCount >= MaxOpenSequences - 1) ||
                                      (DecisionMode == decisionRankedDeterministic && MaxStartsPerBar > 0 && startsExecutedThisBar >= MaxStartsPerBar - 1));
+            bool mrCompetes = routeMr && mrSessionOpen;
             if(DecisionMode == decisionRankedDeterministic &&
                StrategyTieBreak == stratMrFirst &&
-               routeMr && mrSessionOpen &&
+               mrCompetes &&
                scarceStartSlots)
                continue;
             if(DecisionMode == decisionRankedDeterministic && MaxStartsPerBar > 0 && startsExecutedThisBar >= MaxStartsPerBar)
@@ -6419,10 +6628,41 @@ void OnTick()
                                      : (trIncA > EPS && downCrossA <= levelA && (MaxSpreadPips <= 0 || spreadA <= maxSpreadPtsA));
             bool bTrendBreak = isBuy ? (trIncB > EPS && upCrossB >= levelB && (MaxSpreadPips <= 0 || spreadB <= maxSpreadPtsB))
                                      : (trIncB > EPS && downCrossB <= levelB && (MaxSpreadPips <= 0 || spreadB <= maxSpreadPtsB));
-            bool aTrendRetest = isBuy ? (trIncA > EPS && upCrossA >= (levelA + trIncA - EPS) && downCrossA <= levelA)
-                                      : (trIncA > EPS && downCrossA <= (levelA - trIncA + EPS) && upCrossA >= levelA);
-            bool bTrendRetest = isBuy ? (trIncB > EPS && upCrossB >= (levelB + trIncB - EPS) && downCrossB <= levelB)
-                                      : (trIncB > EPS && downCrossB <= (levelB - trIncB + EPS) && upCrossB >= levelB);
+            // Track Breaches (Sensitive to 15% of an increment)
+            if(isBuy) {
+               if(upCrossA >= levelA + 0.15 * trIncA - EPS) {
+                  activePairs[p].trendBreachTimeBuy = TimeCurrent();
+                  activePairs[p].trendBreachPriceBuy = levelA;
+               }
+               if(upCrossB >= levelB + 0.15 * trIncB - EPS) {
+                  activePairs[p].trendBreachTimeBuy = TimeCurrent();
+                  activePairs[p].trendBreachPriceBuy = levelB;
+               }
+            } else {
+               if(downCrossA <= levelA - 0.15 * trIncA + EPS) {
+                  activePairs[p].trendBreachTimeSell = TimeCurrent();
+                  activePairs[p].trendBreachPriceSell = levelA;
+               }
+               if(downCrossB <= levelB - 0.15 * trIncB + EPS) {
+                  activePairs[p].trendBreachTimeSell = TimeCurrent();
+                  activePairs[p].trendBreachPriceSell = levelB;
+               }
+            }
+
+             bool aTrendRetest = false;
+             datetime bTimeA = isBuy ? activePairs[p].trendBreachTimeBuy : activePairs[p].trendBreachTimeSell;
+             double bPriceA = isBuy ? activePairs[p].trendBreachPriceBuy : activePairs[p].trendBreachPriceSell;
+             if(bTimeA > 0) {
+                int bBarsA = iBarShift(symA, PERIOD_CURRENT, bTimeA);
+                if(bBarsA >= 0 && bBarsA <= Trend_RetestWindow_Bars) {
+                   if(isBuy) aTrendRetest = (downCrossA <= bPriceA + EPS && upCrossA >= bPriceA - EPS);
+                   else aTrendRetest = (upCrossA >= bPriceA - EPS && downCrossA <= bPriceA + EPS);
+                } else {
+                   if(isBuy) { activePairs[p].trendBreachTimeBuy = 0; activePairs[p].trendBreachPriceBuy = 0; }
+                   else { activePairs[p].trendBreachTimeSell = 0; activePairs[p].trendBreachPriceSell = 0; }
+                }
+             }
+            bool bTrendRetest = aTrendRetest; // For solo mode, B follows A logic or uses same breach state
             double trendBlockThrA = ResolveMinIncrementForStrategy(TrendMinIncrementBlock_Pips, symA, STRAT_TRENDING);
             double trendBlockThrB = ResolveMinIncrementForStrategy(TrendMinIncrementBlock_Pips, symB, STRAT_TRENDING);
             bool aOk = ((TrendEntryType == trendEntryBreak) ? aTrendBreak : aTrendRetest) &&
@@ -6500,13 +6740,18 @@ void OnTick()
                         " level=", DoubleToString(trendLevelPrice, trendDigits),
                         " cross=", DoubleToString(trendCross, trendDigits));
                g_seqMgr.m_sequences[seqIdx].entryMmIncrement = trendInc;
-               bool openedTrend = OpenOrderWithContext(seqIdx, orderType, trendSym, STRAT_TRENDING);
-               if(openedTrend)
-                 {
-                  if(isBuy)
-                     buyStartedNow = true;
-                  else
-                     sellStartedNow = true;
+                bool openedTrend = OpenOrderWithContext(seqIdx, orderType, trendSym, STRAT_TRENDING);
+                if(openedTrend)
+                  {
+                   if(isBuy) {
+                      buyStartedNow = true;
+                      activePairs[p].trendBreachTimeBuy = 0;
+                      activePairs[p].trendBreachPriceBuy = 0;
+                   } else {
+                      sellStartedNow = true;
+                      activePairs[p].trendBreachTimeSell = 0;
+                      activePairs[p].trendBreachPriceSell = 0;
+                   }
                   if(MaxOpenSequences > 0)
                      openMrSequenceCount++;
                   if(DecisionMode == decisionRankedDeterministic)
@@ -7406,6 +7651,164 @@ int ComputeHoldTimeStats(double &avgHoldSecOut, double &maxHoldSecOut,
   }
 
 //+------------------------------------------------------------------+
+//| End-of-test per-symbol statistics                                |
+//+------------------------------------------------------------------+
+void PrintPerSymbolStats()
+  {
+   if(g_symEquityTrackerCount > 0)
+     {
+      Print(" ");
+      Print("=== End of Test Per-Symbol Statistics ===");
+     }
+     
+   double totalNetProfit = 0;
+   double totalGrossProfit = 0;
+   double totalGrossLoss = 0;
+   double totalMaxDrawdown = 0;
+   int totalTrades = 0;
+   
+   int handle = INVALID_HANDLE;
+   if(MQLInfoInteger(MQL_OPTIMIZATION))
+     {
+      string fileName = "PerSymbolStats_Optimization.csv";
+      handle = FileOpen(fileName, FILE_CSV|FILE_READ|FILE_WRITE|FILE_ANSI|FILE_COMMON, ",");
+      if(handle != INVALID_HANDLE)
+        {
+         // We only want to write a header once per file. If it's a new file, it will be at pos 0
+         if(FileSize(handle) == 0)
+           {
+            FileWrite(handle, "Pass", "Symbol", "Trades", "NetProfit", "MaxDrawdown", "ProfitFactor", "RecoveryFactor", "R2");
+           }
+         FileSeek(handle, 0, SEEK_END);
+        }
+     }
+     
+   // Inside OnTester, the exact optimization Pass ID isn't directly exposed (it's only in OnTesterDeinit). 
+   // Instead, we create a highly unique fingerprint using the final test outcomes (Total Trades + Profit) 
+   // so that you can easily match the CSV row to the EXACT pass in the MT5 Optimization Results tab.
+   string passStr = "Trds:" + IntegerToString((int)TesterStatistics(STAT_TRADES)) + "_Pl:" + DoubleToString(TesterStatistics(STAT_PROFIT), 2);
+   for(int i=0; i<g_symEquityTrackerCount; i++)
+     {
+      double pf = (g_symEquityTracker[i].grossLoss > 0.0) ? (g_symEquityTracker[i].grossProfit / g_symEquityTracker[i].grossLoss) : (g_symEquityTracker[i].grossProfit > 0.0 ? 999.99 : 0.0);
+      double rf = (g_symEquityTracker[i].maxDrawdown > 0.0) ? (g_symEquityTracker[i].closedProfit / g_symEquityTracker[i].maxDrawdown) : (g_symEquityTracker[i].closedProfit > 0.0 ? 999.99 : 0.0);
+      
+      int n = g_symEquityTracker[i].sampleCount;
+      double r2 = 0.0;
+      if(n >= 4)
+        {
+         double meanX = (double)(n - 1) * 0.5;
+         double meanY = 0.0;
+         for(int j=0; j<n; j++) meanY += g_symEquityTracker[i].equitySamples[j];
+         meanY /= (double)n;
+         
+         double sXY = 0.0, sXX = 0.0;
+         for(int j=0; j<n; j++)
+           {
+            double dx = (double)j - meanX;
+            sXY += dx * (g_symEquityTracker[i].equitySamples[j] - meanY);
+            sXX += dx * dx;
+           }
+         if(sXX > 1e-20)
+           {
+            double slope = sXY / sXX;
+            // Only reward positive slope
+            if(slope > 0.0)
+              {
+               double intercept = meanY - slope * meanX;
+               double ssTot = 0.0, ssRes = 0.0;
+               for(int j=0; j<n; j++)
+                 {
+                  double predY = intercept + slope * (double)j;
+                  ssTot += MathPow(g_symEquityTracker[i].equitySamples[j] - meanY, 2.0);
+                  ssRes += MathPow(g_symEquityTracker[i].equitySamples[j] - predY, 2.0);
+                 }
+               r2 = (ssTot > 1e-20) ? 1.0 - (ssRes / ssTot) : 0.0;
+               if(r2 < 0.0) r2 = 0.0;
+              }
+           }
+        }
+        
+      PrintFormat("Sym: %s | Trades: %d | Net: %.2f | DD: %.2f | PF: %.2f | RF: %.2f | R2: %.4f",
+                  g_symEquityTracker[i].symbol, 
+                  g_symEquityTracker[i].trades, 
+                  g_symEquityTracker[i].closedProfit, 
+                  g_symEquityTracker[i].maxDrawdown, 
+                  pf, rf, r2);
+                  
+      totalNetProfit += g_symEquityTracker[i].closedProfit;
+      totalTrades += g_symEquityTracker[i].trades;
+      
+      if(handle != INVALID_HANDLE)
+        {
+         FileWrite(handle, passStr, g_symEquityTracker[i].symbol, g_symEquityTracker[i].trades, g_symEquityTracker[i].closedProfit, g_symEquityTracker[i].maxDrawdown, pf, rf, r2);
+        }
+     }
+     
+   if(g_symEquityTrackerCount > 0)
+     {
+      // To get accurate True Total DD and Portfolio Equity Metrics, we do NOT use the sum. 
+      // We pull them directly from the official TesterStatistics global data!
+      double officialNetProfit = TesterStatistics(STAT_PROFIT);
+      double officialGrossProfit = TesterStatistics(STAT_GROSS_PROFIT);
+      double officialGrossLoss = TesterStatistics(STAT_GROSS_LOSS);
+      double officialMaxDD = TesterStatistics(STAT_EQUITY_DD);
+      
+      double totalPf = (officialGrossLoss > 0.0) ? (officialGrossProfit / officialGrossLoss) : (officialGrossProfit > 0.0 ? 999.99 : 0.0);
+      double totalRf = (officialMaxDD > 0.0) ? (officialNetProfit / officialMaxDD) : (officialNetProfit > 0.0 ? 999.99 : 0.0);
+      
+      // Calculate Global Equity R2 for Total Row
+      double totalR2 = 0.0;
+      int m = g_equityCount;
+      if(m >= 4)
+        {
+         double meanX = (double)(m - 1) * 0.5;
+         double meanY = 0.0;
+         for(int j=0; j<m; j++) meanY += g_equitySeries[j];
+         meanY /= (double)m;
+         
+         double sXY = 0.0, sXX = 0.0;
+         for(int j=0; j<m; j++)
+           {
+            double dx = (double)j - meanX;
+            sXY += dx * (g_equitySeries[j] - meanY);
+            sXX += dx * dx;
+           }
+         if(sXX > 1e-20)
+           {
+            double slope = sXY / sXX;
+            if(slope > 0.0)
+              {
+               double intercept = meanY - slope * meanX;
+               double ssTot = 0.0, ssRes = 0.0;
+               for(int j=0; j<m; j++)
+                 {
+                  double predY = intercept + slope * (double)j;
+                  ssTot += MathPow(g_equitySeries[j] - meanY, 2.0);
+                  ssRes += MathPow(g_equitySeries[j] - predY, 2.0);
+                 }
+               totalR2 = (ssTot > 1e-20) ? 1.0 - (ssRes / ssTot) : 0.0;
+               if(totalR2 < 0.0) totalR2 = 0.0;
+              }
+           }
+        }
+      
+      Print("-----------------------------------------");
+      PrintFormat("Total: Trades: %d | Net: %.2f | Max DD: %.2f | PF: %.2f | RF: %.2f | R2: %.4f",
+                  totalTrades, officialNetProfit, officialMaxDD, totalPf, totalRf, totalR2);
+                  
+      if(handle != INVALID_HANDLE)
+        {
+         FileWrite(handle, passStr, "TOTAL", totalTrades, officialNetProfit, officialMaxDD, totalPf, totalRf, totalR2);
+         FileClose(handle);
+         Print("Optimizer stats saved to common/tester/files/PerSymbolStats_Optimization.csv");
+        }
+
+      Print("=========================================");
+      Print(" ");
+     }
+  }
+
+//+------------------------------------------------------------------+
 //|  Custom optimization score for MT5 tester                        |
 //|  Zero score if profit<=0 or PF<1                                 |
 //|  R²  equity-curve quality gates the score (slope<=0 = zero).    |
@@ -7415,6 +7818,9 @@ int ComputeHoldTimeStats(double &avgHoldSecOut, double &maxHoldSecOut,
 //+------------------------------------------------------------------+
 double OnTester()
   {
+   UpdateSymbolEquitySamples();
+   PrintPerSymbolStats();
+   
    double profit = TesterStatistics(STAT_PROFIT);
    double pf = TesterStatistics(STAT_PROFIT_FACTOR);
    if(profit <= 0.0 || pf < 1.0 || !MathIsValidNumber(profit) || !MathIsValidNumber(pf))
