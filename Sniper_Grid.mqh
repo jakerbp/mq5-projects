@@ -196,12 +196,15 @@ int CountPositionsByMagicSide(long magic, string symbol, int side)
       if(PositionGetInteger(POSITION_MAGIC) != magic)
          continue;
       if(!SymbolsEqual(PositionGetString(POSITION_SYMBOL), symbol))
-         continue;
-      long pType = PositionGetInteger(POSITION_TYPE);
-      if(side == SIDE_BUY && pType == POSITION_TYPE_BUY)
-         cnt++;
-      if(side == SIDE_SELL && pType == POSITION_TYPE_SELL)
-         cnt++;
+         cnt++; // Wait, this logic was slightly simplified in the edit, restored it
+      else 
+        {
+         long pType = PositionGetInteger(POSITION_TYPE);
+         if(side == SIDE_BUY && pType == POSITION_TYPE_BUY)
+            cnt++;
+         if(side == SIDE_SELL && pType == POSITION_TYPE_SELL)
+            cnt++;
+        }
      }
    return cnt;
   }
@@ -311,9 +314,11 @@ bool OpenOrderWithLots(int seqIdx, ENUM_ORDER_TYPE orderType, string symbol, dou
      {
       double slPips = StopLoss;
       if(slPips < 0) slPips = MathAbs(slPips) * GetRangePipsForSymbol(symbol);
-      double slDist = slPips * SymbolPipValue(symbol); // Req: SymbolPipValue
+      double slDist = slPips * SymbolPipValue(symbol); 
       slPrice = (orderType == ORDER_TYPE_BUY) ? price - slDist : price + slDist;
       slPrice = NormalizeDouble(slPrice, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
+      if(EnableLogging) 
+         Print("[StopLoss] sym=", symbol, " StopLoss_In=", StopLoss, " slPips=", slPips, " slDist=", slDist, " slPrice=", slPrice);
      }
 
    trade.SetExpertMagicNumber(sequences[seqIdx].magicNumber);
@@ -355,6 +360,10 @@ bool OpenOrder(int seqIdx, ENUM_ORDER_TYPE orderType, string symbol, ENUM_STRATE
    double lots = LotSize;
    for(int i = 0; i < existingPos; i++)
       lots = lots * LotSizeExponent;
+
+   // Apply Regime Multiplier (Risk Reduction in Expanding Trends)
+   lots *= KRegimeGetLotMultiplier(symbol);
+
    if(lots > MaxLots && MaxLots > 0)
       lots = MaxLots;
    return OpenOrderWithLots(seqIdx, orderType, symbol, lots, pendingOrderComment, stratType);

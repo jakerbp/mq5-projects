@@ -50,12 +50,12 @@ enum enumTrendAddMode { trendAddProfitRetest=0, trendAddAdverseAveraging=1, tren
 enum enumBreakoutMrDrawdownMode { boMrDdOff=0, boMrDdSameSymbol=1, boMrDdSameCurrency=2 };
 enum enumVisualTheme { themeDark=0, themeLight=1 };
 enum enumRangeMetric { rangeAtr=0, rangeKeltnerWidth=1 };
-enum enumMarkovMode
+enum enumRegimeBlockMode
   {
-   markovModeOff=0,        // Markov disabled
-   markovModeDirectional=1, // Directional bias only
-   markovModeTrending=2,   // Trade only in trending regime
-   markovModeRanging=3     // Trade only in ranging regime
+   regimeModeOff = 0,             // Regime Filter Disabled
+   regimeModeBlockAgainstTrend = 1, // Block trades against a contained/expanding trend
+   regimeModeBlockUnlessTrending = 2, // Only trade when a trend is active
+   regimeModeBlockUnlessRanging = 3   // Only trade when market is ranging
   };
 enum ENUM_DECISION_MODE { decisionLegacyParity=0, decisionRankedDeterministic=1 };
 enum ENUM_STRATEGY_TIEBREAK { stratTrendFirst=0, stratMrFirst=1 };
@@ -132,12 +132,12 @@ struct TickPositionRow
 // Include modular headers AFTER all enums/structs/constants are defined
 #include "Sniper_SequenceManager.mqh"
 #include "Sniper_Math.mqh"
+#include "Sniper_KeltnerRegime.mqh"
 // Temporary compatibility bridge for legacy grid module.
 #define sequences g_seqMgr.m_sequences
 #include "Sniper_Grid.mqh"
 #undef sequences
 #include "Sniper_UI.mqh"
-#include "Sniper_Markov.mqh"
 #include "Sniper_Strategy.mqh"
 input group "~~~~~~~~~General Settings~~~~~~~~~";
 input long    MAGIC_NUMBER = 20250215;             // Magic Number
@@ -158,7 +158,7 @@ input int     MaxAddsPerBar = 0;                     // Max grid adds per bar (0
 input group "#### Mean Reversion Strategy ####";
 input bool    EnableMeanReversion = true;           // Enable Mean Reversion
 input bool    AllowNewMeanReversionSequences = true; // Allow New MR Sequences
-input enumMarkovMode MeanReversionMarkovMode = markovModeOff; // MR Markov Mode (Off/Directional/Trending/Ranging)
+input enumRegimeBlockMode MeanReversionRegimeMode = regimeModeOff; // MR Regime Mode (Off/Block-Against/Only-Trend/Only-Range)
 input enumTf  MrMM_Timeframe = tfH1;                // MR Murrey Timeframe
 input int     MrMM_Lookback = 96;                  // MR Murrey Lookback
 input int     EntryMmLevel = 8;                     // MR Entry MM Level for Sell (-2..10, Buy mirrors as 8-level)
@@ -181,7 +181,7 @@ input enumTrailFrequency TrailFrequency = trailEveryTick; // MR Trailing SL Upda
 input group "#### Trending Strategy ####";
 input bool    EnableTrendingStrategy = false;       // Enable Trending Strategy
 input bool    AllowNewTrendingSequences = true;     // Allow New Trending Sequences
-input enumMarkovMode TrendingMarkovMode = markovModeOff; // Trend Markov Mode (Off/Directional/Trending/Ranging)
+input enumRegimeBlockMode TrendingRegimeMode = regimeModeOff; // Trend Regime Mode (Off/Block-Against/Only-Trend/Only-Range)
 input enumTrendEntryType TrendEntryType = trendEntryBreakRetest; // Trending Entry Type
 input enumTrendAddMode TrendAddMode = trendAddProfitRetest; // Trend Add Mode
 input int     TrendEntryMmLevel = 2;                // Trending Entry MM Level for Sell (-2..10, Buy mirrors)
@@ -217,6 +217,13 @@ input int     MaxSequencesPerDay = 0;                // Max Sequences/Day (0=off
 input int     MaxDailyWinners = 0;                   // Max Daily Winners (0=off)
 input int     MaxDailyLosers = 0;                    // Max Daily Losers (0=off)
 input enumRestart MaxSequencesRestartEa = restartNextDay; // Restart After Max
+input group "#### Dynamic Regime Scaling ####";
+input double  DynamicGrid_CalmRangeMult = 1.0;       // Grid Mult: Calm Range
+input double  DynamicGrid_DirRangeMult = 0.8;        // Grid Mult: Directional Range (Aggressive)
+input double  DynamicGrid_ContainedTrendMult = 1.25; // Grid Mult: Contained Trend (Conservative)
+input double  DynamicGrid_ExpandingTrendMult = 2.0;  // Grid Mult: Expanding Trend (Safety)
+input double  DynamicLot_ExpandingTrendMult = 0.5;   // Lot Mult: Expanding Trend (Risk Reduction)
+
 
 //input group "#### MM Levels ####";
 const enumEntryPriceType EntryPriceType = entryOnTick; // Entry Source (Close/Tick)
@@ -232,28 +239,14 @@ input double  KeltnerAtrMultiplier = 1.5;           // Keltner ATR Multiplier (b
 const int     EMA_FilterPeriod = 0;                 // EMA Filter Period (0=off)
 const enumTf  EMA_FilterTimeframe = tfH1;           // EMA Filter Timeframe
 
-input group "#### Markov Regime Filter ####";
-input enumTf  Markov_RegimeTimeframe = tfH1;        // Regime Detection Timeframe
-input int     Markov_Lookback = 50;                 // Momentum Lookback
-input int     Markov_ATRLength = 50;                // ATR Length
-input int     Markov_SmoothLen = 5;                 // Momentum EMA Smoothing
-input double  Markov_TriggerATR = 0.8;              // Trend Entry Threshold (ATR)
-input double  Markov_ExitATR = 0.6;                 // Trend Exit Threshold (ATR)
-input int     Markov_VolPercentileLookback = 100;   // Volatility Percentile Lookback
-input double  Markov_MemoryDecay = 0.97;            // Transition Memory Decay
-input bool    Markov_UseSecondOrder = true;         // Use 2nd Order Markov
-input int     Markov_EvEmaLength = 20;              // Expected Value EMA Length
-input double  Markov_MinSampleSize = 5.0;           // Minimum Effective Sample
-input int     Markov_RangeLookback = 50;            // Structural Range Lookback
-input int     Markov_MacroLen = 100;                // Macro EMA
-input int     Markov_MicroLen = 20;                 // Micro EMA
-input int     Markov_SlopeLen = 20;                 // Macro Slope Length
-input double  Markov_SlopeFlatAtrMult = 0.10;       // Flat Slope Threshold (ATR multiple)
-input int     Markov_MinTrendBars = 10;             // Minimum Trend Duration
-input bool    Markov_BlockIfUntrained = false;      // Block Entries Before Model Trained
-input double  Markov_MinConfidence = 0.65;          // Min Confidence for Directional Block
-input double  Markov_MinProbGap = 0.10;             // Min (P(up)-P(down)) Gap for Directional Block
-input double  Markov_MinEdge = 0.02;                // Min |Edge| for Directional Block
+input group "#### Keltner Regime Filter ####";
+input enumTf  KRegime_Timeframe = tfH1;             // Regime Detection Timeframe
+input int     KRegime_VwmaPeriod = 50;              // VWMA Period (Centerline)
+input int     KRegime_AtrPeriod = 50;               // ATR Period
+input double  KRegime_AtrMult = 2.0;                // ATR Multiplier (Bands)
+input int     KRegime_SlopeLookback = 3;            // Slope/Width Lookback (Bars)
+input double  KRegime_FlatThresholdAtr = 0.20;      // Trend Threshold (ATR %)
+input double  KRegime_WidthThresholdAtr = 0.10;     // Width Expansion Threshold (ATR %)
 
 input group "#### LP-vs-Murrey Filter ####";
 input enumTf  LP_MM_Timeframe = tfH4;                 // LP Filter: Murrey Timeframe
@@ -1293,6 +1286,16 @@ bool IsManagedPositionComment(string comment)
    return (StringFind(comment, "ZSM") == 0);
   }
 
+bool IsOurEAUniqueMagic(long magic)
+  {
+   if(magic == MAGIC_NUMBER) return true;
+   for(int i = 0; i < MAX_PAIRS * 2; i++)
+      if(g_seqMgr.m_sequences[i].magicNumber == magic && magic > 0) return true;
+   for(int i = 0; i < MAX_SYMBOLS; i++)
+      if(breakoutMagic[i] == magic && magic > 0) return true;
+   return false;
+  }
+
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
@@ -1614,120 +1617,83 @@ bool IsRangeStrengthQualified(const string symbol)
    return (rBase >= lo && rBase <= hi && rQuote >= lo && rQuote <= hi);
   }
 
-bool AnyStrategyMarkovEnabled()
+bool AnyStrategyRegimeEnabled()
   {
-   return (MeanReversionMarkovMode != markovModeOff ||
-           TrendingMarkovMode != markovModeOff);
+   return (MeanReversionRegimeMode != regimeModeOff ||
+           TrendingRegimeMode != regimeModeOff);
   }
 
-bool GetMarkovRegimeFlags(const string symbol, const enumMarkovMode modeIn,
-                          bool &trendingOut, bool &rangingOut, int &stateOut)
+bool GetKeltnerRegimeFlags(const string symbol, const enumRegimeBlockMode modeIn,
+                          bool &trendingOut, bool &rangingOut, ENUM_KREGIME_STATE &stateOut)
   {
    trendingOut = false;
    rangingOut = false;
-   stateOut = MARKOV_NEUTRAL;
-   enumMarkovMode mode = modeIn;
-   if(mode == markovModeOff)
+   stateOut = KREGIME_NA;
+   if(modeIn == regimeModeOff)
       return false;
-   MarkovUpdateSymbol(symbol);
-   double conf = 0.0, edge = 0.0, pUp = 0.0, pDown = 0.0, effN = 0.0, volRatio = 1.0;
+   KRegimeUpdateSymbol(symbol);
+   double midSlope = 0.0, widthDelta = 0.0;
    bool valid = false;
-   if(!MarkovGetSnapshot(symbol, stateOut, conf, edge, pUp, pDown, effN, volRatio, valid))
-      return false;
-   if(!valid)
+   if(!KRegimeGetSnapshot(symbol, stateOut, midSlope, widthDelta, valid) || !valid)
       return false;
       
-   double dynamicConfReq = Markov_MinConfidence;
-   if(volRatio > 1.2)
-      dynamicConfReq = MathMin(1.0, dynamicConfReq * MathMin(1.5, volRatio));
-      
-   trendingOut = (stateOut != MARKOV_NEUTRAL && conf >= dynamicConfReq);
+   trendingOut = (stateOut != KREGIME_CALM_RANGE && stateOut != KREGIME_DIRECTIONAL_UP && stateOut != KREGIME_DIRECTIONAL_DOWN);
    rangingOut = !trendingOut;
    return true;
   }
 
-bool MarkovModeAllowsEntry(const string symbol, const int side, const bool isTrendStrategy,
-                           const enumMarkovMode modeIn, string &reasonOut)
+bool RegimeModeAllowsEntry(const string symbol, const int side, const bool isTrendStrategy,
+                             const enumRegimeBlockMode modeIn, string &reasonOut)
   {
    reasonOut = "";
-   enumMarkovMode mode = modeIn;
-   if(mode == markovModeOff)
+   if(modeIn == regimeModeOff)
       return true;
 
-   MarkovUpdateSymbol(symbol);
-   int st = MARKOV_NEUTRAL;
-   double conf = 0.0, edge = 0.0, pUp = 0.0, pDown = 0.0, effN = 0.0, volRatio = 1.0;
+   KRegimeUpdateSymbol(symbol);
+   ENUM_KREGIME_STATE st = KREGIME_NA;
+   double midSlope = 0.0, widthDelta = 0.0;
    bool valid = false;
-   if(!MarkovGetSnapshot(symbol, st, conf, edge, pUp, pDown, effN, volRatio, valid))
+   if(!KRegimeGetSnapshot(symbol, st, midSlope, widthDelta, valid))
      {
       reasonOut = "no_ctx";
-      if(mode == markovModeTrending || mode == markovModeRanging)
-         return false;
-      return !Markov_BlockIfUntrained;
+      return false;
      }
    if(!valid)
      {
       reasonOut = "n_low";
-      if(mode == markovModeTrending || mode == markovModeRanging)
-         return false;
-      return !Markov_BlockIfUntrained;
+      return false;
      }
 
-   double dynamicConfReq = Markov_MinConfidence;
-   if(volRatio > 1.2)
-      dynamicConfReq = MathMin(1.0, dynamicConfReq * MathMin(1.5, volRatio));
+   bool isTrending = (st != KREGIME_CALM_RANGE && st != KREGIME_DIRECTIONAL_UP && st != KREGIME_DIRECTIONAL_DOWN);
+   bool isRanging = !isTrending;
 
-   bool regimeTrending = (st != MARKOV_NEUTRAL && conf >= dynamicConfReq);
-   bool regimeRanging = !regimeTrending;
-
-   if(mode == markovModeTrending)
+   if(modeIn == regimeModeBlockUnlessTrending && !isTrending)
      {
-      if(!regimeTrending)
-        {
-         reasonOut = "regime_not_trending";
-         return false;
-        }
-      if(isTrendStrategy)
-        {
-         if((side == SIDE_BUY && st != MARKOV_UPTREND) ||
-            (side == SIDE_SELL && st != MARKOV_DOWNTREND))
-           {
-            reasonOut = "trend_state_mismatch";
-            return false;
-           }
-        }
+      reasonOut = "regime_not_trending";
+      return false;
      }
-   else
-      if(mode == markovModeRanging && !regimeRanging)
-        {
-         reasonOut = "regime_not_ranging";
-         return false;
-        }
-
-   // Directional bias guard (applies in directional mode and as an extra safety in trending mode).
-   if(mode == markovModeDirectional || mode == markovModeTrending)
+   if(modeIn == regimeModeBlockUnlessRanging && !isRanging)
      {
-      double probGapUp = pUp - pDown;
-      double probGapDown = pDown - pUp;
+      reasonOut = "regime_not_ranging";
+      return false;
+     }
+
+   // Directional bias guard
+   if(modeIn == regimeModeBlockAgainstTrend || modeIn == regimeModeBlockUnlessTrending)
+     {
       if(side == SIDE_BUY)
         {
-         bool trendBiasDown = (st == MARKOV_DOWNTREND && conf >= dynamicConfReq &&
-                               probGapDown >= Markov_MinProbGap);
-         bool edgeBiasDown = (edge <= -Markov_MinEdge);
-         if(trendBiasDown || edgeBiasDown)
+         if(st == KREGIME_CONTAINED_DOWN || st == KREGIME_EXPANDING_DOWN)
            {
-            reasonOut = "bear_bias";
+            reasonOut = "bear_trend_block";
             return false;
            }
         }
       else
         {
-         bool trendBiasUp = (st == MARKOV_UPTREND && conf >= dynamicConfReq &&
-                             probGapUp >= Markov_MinProbGap);
-         bool edgeBiasUp = (edge >= Markov_MinEdge);
-         if(trendBiasUp || edgeBiasUp)
+         if(st == KREGIME_CONTAINED_UP || st == KREGIME_EXPANDING_UP)
            {
-            reasonOut = "bull_bias";
+            reasonOut = "bull_trend_block";
             return false;
            }
         }
@@ -1738,33 +1704,59 @@ bool MarkovModeAllowsEntry(const string symbol, const int side, const bool isTre
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
-void GetMarkovDashboardState(const string symbol, string &stateOut, string &confOut)
+void GetRegimeDashboardState(const string symbol, string &stateOut, string &slopeOut)
   {
    stateOut = "N/A";
-   confOut = "N/A";
-   if(!AnyStrategyMarkovEnabled())
+   slopeOut = "N/A";
+   if(!AnyStrategyRegimeEnabled())
       return;
 
-   MarkovUpdateSymbol(symbol);
-   int st = MARKOV_NEUTRAL;
-   double conf = 0.0, edge = 0.0, pUp = 0.0, pDown = 0.0, effN = 0.0, volRatio = 1.0;
+   KRegimeUpdateSymbol(symbol);
+   ENUM_KREGIME_STATE st = KREGIME_NA;
+   double midSlope = 0.0, widthDelta = 0.0;
    bool valid = false;
-   if(!MarkovGetSnapshot(symbol, st, conf, edge, pUp, pDown, effN, volRatio, valid) || !valid)
+   if(!KRegimeGetSnapshot(symbol, st, midSlope, widthDelta, valid) || !valid)
       return;
 
-   if(st == MARKOV_UPTREND)
-      stateOut = "UPTREND";
-   else if(st == MARKOV_DOWNTREND)
-      stateOut = "DOWNTREND";
-   else
-      stateOut = "NEUTRAL";
+   stateOut = KRegimeStateName(st);
+   slopeOut = DoubleToString(midSlope, 2);
+  }
 
-   int confPct = (int)MathRound(conf * 100.0);
-   if(confPct < 0)
-      confPct = 0;
-   if(confPct > 100)
-      confPct = 100;
-   confOut = IntegerToString(confPct) + "%";
+//+------------------------------------------------------------------+
+//|  Regime Multipliers                                              |
+//+------------------------------------------------------------------+
+double KRegimeGetGridMultiplier(const string symbol)
+  {
+   ENUM_KREGIME_STATE st = KREGIME_NA;
+   double midSlope = 0.0, widthDelta = 0.0;
+   bool valid = false;
+   if(!KRegimeGetSnapshot(symbol, st, midSlope, widthDelta, valid) || !valid)
+      return 1.0;
+
+   switch(st)
+     {
+      case KREGIME_CALM_RANGE: return DynamicGrid_CalmRangeMult;
+      case KREGIME_DIRECTIONAL_UP:
+      case KREGIME_DIRECTIONAL_DOWN: return DynamicGrid_DirRangeMult;
+      case KREGIME_CONTAINED_UP:
+      case KREGIME_CONTAINED_DOWN: return DynamicGrid_ContainedTrendMult;
+      case KREGIME_EXPANDING_UP:
+      case KREGIME_EXPANDING_DOWN: return DynamicGrid_ExpandingTrendMult;
+      default: return 1.0;
+     }
+  }
+
+double KRegimeGetLotMultiplier(const string symbol)
+  {
+   ENUM_KREGIME_STATE st = KREGIME_NA;
+   double midSlope = 0.0, widthDelta = 0.0;
+   bool valid = false;
+   if(!KRegimeGetSnapshot(symbol, st, midSlope, widthDelta, valid) || !valid)
+      return 1.0;
+
+   if(st == KREGIME_EXPANDING_UP || st == KREGIME_EXPANDING_DOWN)
+      return DynamicLot_ExpandingTrendMult;
+   return 1.0;
   }
 
 //+------------------------------------------------------------------+
@@ -1844,7 +1836,9 @@ string GetSequenceTradeSymbol(int seqIdx, int pairIdx)
   {
    if(StringLen(g_seqMgr.m_sequences[seqIdx].tradeSymbol) > 0)
       return g_seqMgr.m_sequences[seqIdx].tradeSymbol;
-   return activePairs[pairIdx].symbolA;
+   if(pairIdx >= 0 && pairIdx < numActivePairs)
+      return activePairs[pairIdx].symbolA;
+   return "";
   }
 
 //+------------------------------------------------------------------+
@@ -1991,7 +1985,7 @@ bool CachedCalcMurreyLevelsForSymbol(const string symbol,
                                                 mm88, mm48, mm08, inc, p28, p18, m18, m28);
   }
 
-bool MarkovUpdateUniqueOncePerBar(const string symbol, string &updatedSymbols[])
+bool RegimeUpdateUniqueOncePerBar(const string symbol, string &updatedSymbols[])
   {
    if(StringLen(symbol) == 0)
       return false;
@@ -2003,7 +1997,7 @@ bool MarkovUpdateUniqueOncePerBar(const string symbol, string &updatedSymbols[])
    int n = ArraySize(updatedSymbols);
    ArrayResize(updatedSymbols, n + 1);
    updatedSymbols[n] = symbol;
-   return MarkovUpdateSymbol(symbol);
+   return KRegimeUpdateSymbol(symbol);
   }
 
 void MaybeUpdateLockProfitChartLines()
@@ -2904,13 +2898,32 @@ void RunScanner()
          continue;
         }
 
-      // Claim it
-      tempSequences[freeSlot].magicNumber = oMagic;
-      tempSequences[freeSlot].active      = true;
-      tempSequences[freeSlot].tradeSymbol = oSym;
-      tempSequences[freeSlot].side        = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? SIDE_BUY : SIDE_SELL;
-      Print("[OrphanRescue] Rescued orphan magic=", oMagic, " sym=", oSym,
-            " -> slot=", freeSlot);
+      // Claim it and attempt to preserve state if it existed in the previous portfolio
+      int oldIdx = -1;
+      for(int s3 = 0; s3 < MAX_PAIRS * 2; s3++)
+        {
+         if(g_seqMgr.m_sequences[s3].magicNumber == oMagic)
+           {
+            oldIdx = s3;
+            break;
+           }
+        }
+
+      if(oldIdx >= 0)
+        {
+         tempSequences[freeSlot] = g_seqMgr.m_sequences[oldIdx];
+         if(EnableLogging)
+            Print("[OrphanRescue] Rescued orphan magic=", oMagic, " sym=", oSym, " (preserved state) -> slot=", freeSlot);
+        }
+      else
+        {
+         tempSequences[freeSlot].magicNumber = oMagic;
+         tempSequences[freeSlot].active      = true;
+         tempSequences[freeSlot].tradeSymbol = oSym;
+         tempSequences[freeSlot].side        = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? SIDE_BUY : SIDE_SELL;
+         if(EnableLogging)
+            Print("[OrphanRescue] Rescued orphan magic=", oMagic, " sym=", oSym, " (new) -> slot=", freeSlot);
+        }
      }
 
 // Commit: overwrite from temp buffer
@@ -2922,6 +2935,7 @@ void RunScanner()
    MarkSequenceMagicCacheDirty();
 
    lastScanTime = TimeCurrent();
+   g_lastPositionsTotal = -1; // Force ScanPositions() on the next tick to rebuild sequence metrics immediately
    Print("[Scanner] Active portfolio: ", numActivePairs, " symbols mode=PortfolioTrader");
   }
 
@@ -2969,13 +2983,14 @@ void ScanPositions()
    for(int i = 0; i < ArraySize(tickPosRows); i++)
      {
       string posComment = tickPosRows[i].comment;
-      if(!IsManagedPositionComment(posComment))
+      long magic = tickPosRows[i].magic;
+      bool isOurMagic = IsOurEAUniqueMagic(magic);
+      if(!IsManagedPositionComment(posComment) && !isOurMagic)
          continue;
       
       // Increment total managed count
       g_cachedTotalManagedPositions++;
 
-      long magic = tickPosRows[i].magic;
       string posSymbol = tickPosRows[i].symbol;
       double posProfit = tickPosRows[i].profit + tickPosRows[i].swap + tickPosRows[i].commission;
       long posType = tickPosRows[i].type;
@@ -3314,8 +3329,10 @@ void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double curr
 
    long magic = g_seqMgr.m_sequences[seqIdx].magicNumber;
    string sym = GetSequenceTradeSymbol(seqIdx, pairIdx);
-   if(StringLen(sym) == 0)
+   if(StringLen(sym) == 0 && pairIdx >= 0 && pairIdx < numActivePairs)
       sym = activePairs[pairIdx].symbolA;
+   if(StringLen(sym) == 0)
+      return;
    int side = g_seqMgr.m_sequences[seqIdx].side;
 
 // MR/Trending trailing (shared lock-profit logic)
@@ -3352,9 +3369,9 @@ void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double curr
            {
             if(curBid >= avgP + effLP)
               {
-               g_seqMgr.m_sequences[seqIdx].lockProfitExec = true;
-               if(EnableLogging)
-                  Print("[LockProfit] BUY activated for pair ", pairIdx);
+                g_seqMgr.m_sequences[seqIdx].lockProfitExec = true;
+                if(EnableLogging)
+                   Print("[LockProfit] BUY activated for magic ", magic, " (pairIdx=", pairIdx, ") at price ", curBid, " avgP=", avgP, " effLP=", effLP);
               }
            }
          if(g_seqMgr.m_sequences[seqIdx].lockProfitExec)
@@ -3384,9 +3401,9 @@ void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double curr
            {
             if(curAsk <= avgP - effLP)
               {
-               g_seqMgr.m_sequences[seqIdx].lockProfitExec = true;
-               if(EnableLogging)
-                  Print("[LockProfit] SELL activated for pair ", pairIdx);
+                g_seqMgr.m_sequences[seqIdx].lockProfitExec = true;
+                if(EnableLogging)
+                   Print("[LockProfit] SELL activated for magic ", magic, " (pairIdx=", pairIdx, ") at price ", curAsk, " avgP=", avgP, " effLP=", effLP);
               }
            }
          if(g_seqMgr.m_sequences[seqIdx].lockProfitExec)
@@ -5467,12 +5484,12 @@ void DrawDashboard()
          
          string rowR = StringFormat("[%6.1f/%6.1f] %-11s    %-7s", symbolOpenPlLow[i], symbolOpenPlHigh[i], lpPair, newsCell);
          string mkState = "N/A";
-         string mkConf = "N/A";
-         GetMarkovDashboardState(symbol, mkState, mkConf);
+         string mkSlope = "N/A";
+         GetRegimeDashboardState(symbol, mkState, mkSlope);
          
          UpsertInlineLabel("symrow_r_" + IntegerToString(i), rowR, 420, rowLine, neutralClr);
-         UpsertInlineLabel("symrow_mk_" + IntegerToString(i), mkState, c_mk, rowLine, neutralClr);
-         UpsertInlineLabel("symrow_cf_" + IntegerToString(i), mkConf, c_cf, rowLine, neutralClr);
+         string mkCombined = mkState + " (" + mkSlope + ")";
+         UpsertInlineLabel("symrow_mk_" + IntegerToString(i), mkCombined, c_mk, rowLine, neutralClr);
          UpsertSymbolJumpButton(i, rowLine, symbol);
          UpsertSymbolActionButton(i, SIDE_BUY, rowLine, HasOpenSequenceForSymbolSide(symbol, SIDE_BUY));
          UpsertSymbolActionButton(i, SIDE_SELL, rowLine, HasOpenSequenceForSymbolSide(symbol, SIDE_SELL));
@@ -5686,30 +5703,14 @@ int OnInit()
    ParseSymbols();
    dashboardButtonStrategy = DashboardButtonStrategyDefault;
    ResolvePipValueReference();
-   int markovEngineMode = AnyStrategyMarkovEnabled() ? (int)markovModeDirectional : (int)markovModeOff;
-   MarkovSetConfig(markovEngineMode,
-                   (ENUM_TIMEFRAMES)Markov_RegimeTimeframe,
-                   Markov_Lookback,
-                   Markov_ATRLength,
-                   Markov_SmoothLen,
-                   Markov_TriggerATR,
-                   Markov_ExitATR,
-                   Markov_VolPercentileLookback,
-                   Markov_MemoryDecay,
-                   Markov_UseSecondOrder,
-                   Markov_EvEmaLength,
-                   Markov_MinSampleSize,
-                   Markov_RangeLookback,
-                   Markov_MacroLen,
-                   Markov_MicroLen,
-                   Markov_SlopeLen,
-                   Markov_SlopeFlatAtrMult,
-                   Markov_MinTrendBars,
-                   Markov_BlockIfUntrained,
-                   Markov_MinConfidence,
-                   Markov_MinProbGap,
-                   Markov_MinEdge);
-   MarkovPrepareSymbols(allSymbols);
+   KRegimeSetConfig((ENUM_TIMEFRAMES)KRegime_Timeframe,
+                    KRegime_VwmaPeriod,
+                    KRegime_AtrPeriod,
+                    KRegime_AtrMult,
+                    KRegime_SlopeLookback,
+                    KRegime_FlatThresholdAtr,
+                    KRegime_WidthThresholdAtr);
+   KRegimePrepareSymbols(allSymbols);
    RefreshStrengthMatrixIfNeeded(true);
 
 // Chart cleanup: keep user-added chart indicators on symbol/timeframe changes.
@@ -5842,7 +5843,7 @@ void OnDeinit(const int reason)
    ArrayResize(seqMagicCacheSeqIdx, 0);
    seqMagicCacheDirty = true;
    ResetCommissionCache();
-   MarkovRelease();
+   KRegimeRelease();
    Print(EAName, " deinitialized. Reason: ", reason);
   }
 
@@ -6338,16 +6339,16 @@ void OnTick()
       for(int p = 0; p < numActivePairs; p++)
         {
          CalcMurreyLevels(p);
-         if(AnyStrategyMarkovEnabled())
+         if(AnyStrategyRegimeEnabled())
            {
             if(EnablePerfTiming && markovUsStart == 0)
                markovUsStart = PerfNowUs();
             string mkSymA = activePairs[p].symbolA;
             string mkSymB = activePairs[p].symbolB;
             if(StringLen(mkSymA) > 0)
-               MarkovUpdateUniqueOncePerBar(mkSymA, mkUpdatedSymbols);
+               RegimeUpdateUniqueOncePerBar(mkSymA, mkUpdatedSymbols);
             if(StringLen(mkSymB) > 0 && mkSymB != mkSymA)
-               MarkovUpdateUniqueOncePerBar(mkSymB, mkUpdatedSymbols);
+               RegimeUpdateUniqueOncePerBar(mkSymB, mkUpdatedSymbols);
            }
         }
       if(EnablePerfTiming)
@@ -6586,6 +6587,31 @@ void OnTick()
 
          bool routeMr = EnableMeanReversion;
          bool routeTrend = EnableTrendingStrategy;
+
+         // === [TREND_DIAG] LOGGING ===
+         if(EnableLogging && (routeTrend || routeMr))
+           {
+            for(int sideVal = 0; sideVal < 2; sideVal++)
+              {
+               bool isBuy = (sideVal == 0);
+               double levelA = isBuy ? trendBuyLevelPriceA : trendSellLevelPriceA;
+               double levelB = isBuy ? trendBuyLevelPriceB : trendSellLevelPriceB;
+               double crossA = isBuy ? upCrossA : downCrossA;
+               double crossB = isBuy ? upCrossB : downCrossB;
+               double trIncA = activePairs[p].mmIncrement; // simplified for log
+               double trIncB = activePairs[p].mmIncrementB;
+               bool aTrendBreak = isBuy ? (trIncA > EPS && upCrossA >= levelA) : (trIncA > EPS && downCrossA <= levelA);
+               bool bTrendBreak = isBuy ? (trIncB > EPS && upCrossB >= levelB) : (trIncB > EPS && downCrossB <= levelB);
+               bool aOkS = (MaxSpreadPips <= 0 || spreadA <= maxSpreadPtsA);
+               bool bOkS = (MaxSpreadPips <= 0 || spreadB <= maxSpreadPtsB);
+               
+               Print("[TREND_DIAG] ", (isBuy ? "BUY " : "SELL "), symA, "/", symB,
+                     " levelA=", DoubleToString(levelA, digitsA), " crossA=", DoubleToString(crossA, digitsA),
+                     " hitA=", (aTrendBreak ? "Y" : "N"), " sprdA=", DoubleToString(spreadA/SymbolPipValue(symA), 1), "/", MaxSpreadPips,
+                     " sess=", (trendSessionOpen ? "Y" : "N"));
+              }
+           }
+
          if(skipOpenStagesThisTick)
             continue;
          int preferredDir = (DecisionMode == decisionRankedDeterministic && SideTieBreak == sideSellFirst) ? 1 : 0;
@@ -6666,9 +6692,11 @@ void OnTick()
             double trendBlockThrA = ResolveMinIncrementForStrategy(TrendMinIncrementBlock_Pips, symA, STRAT_TRENDING);
             double trendBlockThrB = ResolveMinIncrementForStrategy(TrendMinIncrementBlock_Pips, symB, STRAT_TRENDING);
             bool aOk = ((TrendEntryType == trendEntryBreak) ? aTrendBreak : aTrendRetest) &&
-                       (trendBlockThrA <= 0 || trIncA >= trendBlockThrA - EPS);
+                       (trendBlockThrA <= 0 || trIncA >= trendBlockThrA - EPS) &&
+                       (MaxSpreadPips <= 0 || spreadA <= maxSpreadPtsA);
             bool bOk = ((TrendEntryType == trendEntryBreak) ? bTrendBreak : bTrendRetest) &&
-                       (trendBlockThrB <= 0 || trIncB >= trendBlockThrB - EPS);
+                       (trendBlockThrB <= 0 || trIncB >= trendBlockThrB - EPS) &&
+                       (MaxSpreadPips <= 0 || spreadB <= maxSpreadPtsB);
 
             if(aOk)
               {
@@ -6699,12 +6727,12 @@ void OnTick()
 
             if(StringLen(trendSym) > 0)
               {
-               string markovTrendReason = "";
-               if(!MarkovModeAllowsEntry(trendSym, sideVal, true, TrendingMarkovMode, markovTrendReason))
+               string regimeTrendReason = "";
+               if(!RegimeModeAllowsEntry(trendSym, sideVal, true, TrendingRegimeMode, regimeTrendReason))
                  {
                   if(EnableLogging)
                      Print("[MarkovFilter] TREND ", (isBuy ? "BUY" : "SELL"), " blocked on ", trendSym,
-                           " reason=", markovTrendReason);
+                           " reason=", regimeTrendReason);
                   trendSym = "";
                  }
               }
@@ -6826,7 +6854,7 @@ void OnTick()
                      " hit=",  (dPriceHit?"Y":"N"),
                      " blk=",  (dIncBlk?"Y":"N"),
                      " sess=", (mrSessionOpen?"Y":"N"),
-                     " sprdPips=", DoubleToString(spreadA > 0 ? spreadA/SymbolInfoDouble(symA,SYMBOL_POINT) : 0, 1),
+                     " sprdPips=", DoubleToString(spreadA / (SymbolPipValue(symA)/SymbolInfoDouble(symA,SYMBOL_POINT)), 1),
                      "/", DoubleToString(MaxSpreadPips, 1));
               }
                double levelA = isBuy ? buyEntryLevelPriceA : sellEntryLevelPriceA;
@@ -6911,12 +6939,12 @@ void OnTick()
 
             if(!onCooldown && StringLen(mrEntrySym) > 0)
               {
-               string markovReason = "";
-               if(!MarkovModeAllowsEntry(mrEntrySym, sideVal, false, MeanReversionMarkovMode, markovReason))
+               string regimeReason = "";
+               if(!RegimeModeAllowsEntry(mrEntrySym, sideVal, false, MeanReversionRegimeMode, regimeReason))
                  {
                   if(EnableLogging)
                      Print("[MarkovFilter] ", (isBuy ? "BUY" : "SELL"), " blocked on ", mrEntrySym,
-                           " reason=", markovReason);
+                           " reason=", regimeReason);
                   mrEntrySym = "";
                  }
               }
@@ -6995,6 +7023,8 @@ void OnTick()
             if(g_seqMgr.m_sequences[seqIdx].strategyType != STRAT_TRENDING ||
                g_seqMgr.m_sequences[seqIdx].tradeCount <= 0 ||
                g_seqMgr.m_sequences[seqIdx].tradeCount >= MaxOrders)
+               continue;
+            if(!trendSessionOpen && GetStrategySessionEndAction(STRAT_TRENDING) == SESSION_END_PAUSE)
                continue;
             if(DecisionMode == decisionRankedDeterministic &&
                StrategyTieBreak == stratMrFirst &&
@@ -7102,6 +7132,8 @@ void OnTick()
                g_seqMgr.m_sequences[seqIdx].tradeCount <= 0 ||
                g_seqMgr.m_sequences[seqIdx].tradeCount >= MaxOrders)
                continue;
+            if(!mrSessionOpen && GetStrategySessionEndAction(STRAT_MEAN_REVERSION) == SESSION_END_PAUSE)
+               continue;
             if(DecisionMode == decisionRankedDeterministic &&
                StrategyTieBreak == stratTrendFirst &&
                MaxAddsPerBar > 0 && addsExecutedThisBar >= MaxAddsPerBar - 1)
@@ -7144,6 +7176,10 @@ void OnTick()
 
             double baseInc = (activeSym == symB ? mrIncB : mrIncA);
             double frozenInc = g_seqMgr.m_sequences[seqIdx].entryMmIncrement > EPS ? g_seqMgr.m_sequences[seqIdx].entryMmIncrement : baseInc;
+            
+            // Apply Dynamic Grid Scaling based on Regime
+            frozenInc *= KRegimeGetGridMultiplier(activeSym);
+
             double blockThr = ResolveMinIncrementForStrategy(MrMinIncrementBlock_Pips, activeSym, STRAT_MEAN_REVERSION);
             if(blockThr > 0 && frozenInc < blockThr)
               {
@@ -7236,7 +7272,8 @@ void OnTick()
               }
 
             bool trigger = isBuy ? (execPrice <= nextLevel) : (execPrice >= nextLevel);
-            if(!trigger)
+            bool spreadOk = (MaxSpreadPips <= 0 || spreadA <= maxSpreadPtsA);
+            if(!trigger || !spreadOk)
                continue;
 
             if(EnableLogging)
@@ -7269,6 +7306,54 @@ void OnTick()
                g_seqMgr.m_sequences[sIdx].tradeSymbol = "";
               }
           } // end pair loop
+
+        // --- ORPHAN TRAILING ---
+        // Trailing for orphaned sequences (those with open trades but no longer in activePairs/scanner)
+        for(int i = 0; i < MAX_PAIRS * 2; i++)
+          {
+           if(g_seqMgr.m_sequences[i].tradeCount <= 0)
+              continue;
+           
+           // Check if this sequence belongs to an active pair already handled above
+           bool handled = false;
+           for(int p2 = 0; p2 < numActivePairs; p2++)
+             {
+              if(activePairs[p2].buySeqIdx == i || activePairs[p2].sellSeqIdx == i)
+                {
+                 handled = true;
+                 break;
+                }
+             }
+           if(handled)
+              continue;
+
+           // This is an orphan. It needs trailing if it's not a global lock profit mode.
+           if(LockProfitMode == lpPerSequence)
+             {
+              string oSym = g_seqMgr.m_sequences[i].tradeSymbol;
+              if(StringLen(oSym) == 0) continue;
+              
+              MqlTick oTick;
+              if(!GetCachedTick(oSym, oTick)) continue;
+
+              bool orphanIsTrend = (g_seqMgr.m_sequences[i].strategyType == STRAT_TRENDING);
+              enumTrailFrequency oCheckFreq = g_seqMgr.m_sequences[i].lockProfitExec ?
+                                             (orphanIsTrend ? TrendTrailFrequency : TrailFrequency) :
+                                             (orphanIsTrend ? TrendLockProfitCheckFrequency : LockProfitCheckFrequency);
+              
+              bool doOrphanTrail = false;
+              if(oCheckFreq == trailEveryTick) doOrphanTrail = true;
+              else if(oCheckFreq == trailAtCloseOfBarM1 && newBarM1) doOrphanTrail = true;
+              else if(oCheckFreq == trailAtCloseOfBarChart && newBar) doOrphanTrail = true;
+
+              if(doOrphanTrail)
+                {
+                 if(EnableLogging)
+                    Print("[OrphanTrail] Trailing orphan magic=", g_seqMgr.m_sequences[i].magicNumber, " sym=", oSym);
+                 TrailingForSequence(i, -1, oTick.bid, oTick.ask);
+                }
+             }
+          }
          if(EnablePerfTiming)
             perfPairUsAcc += (PerfNowUs() - pairLogicUsStart);
         } // end efficiency gate

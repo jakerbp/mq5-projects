@@ -89,6 +89,9 @@ public:
       m_sequences[seqIdx].lowestPrice = 0;
       m_sequences[seqIdx].highestPrice = 0;
       m_sequences[seqIdx].avgPrice = 0;
+      m_sequences[seqIdx].lockProfitExec = false;
+      m_sequences[seqIdx].lpTriggerDist = 0;
+      m_sequences[seqIdx].lpTrailDist = 0;
       m_sequences[seqIdx].ticketCount = 0;
      }
 
