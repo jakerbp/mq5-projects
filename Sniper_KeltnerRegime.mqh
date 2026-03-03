@@ -37,6 +37,7 @@ struct KRegimeContext
    int               atrHandle;
    bool              initialized;
    datetime          lastBarTime;
+   ENUM_KREGIME_STATE prevState;
    ENUM_KREGIME_STATE state;
    double            midSlope;
    double            widthDeltaAtr;
@@ -74,6 +75,7 @@ void KRegimeResetContext(KRegimeContext &ctx)
   {
    ctx.initialized = false;
    ctx.lastBarTime = 0;
+   ctx.prevState = KREGIME_NA;
    ctx.state = KREGIME_NA;
    ctx.midSlope = 0.0;
    ctx.widthDeltaAtr = 0.0;
@@ -177,6 +179,9 @@ bool KRegimeUpdateSymbol(const string symbol)
    double widthPrev = upperPrev - lowerPrev;
    ctx.widthDeltaAtr = (widthNow - widthPrev) / htfATR;
 
+   // Preserve previous state for transition-aware policies.
+   ENUM_KREGIME_STATE priorState = ctx.state;
+
    // Regime Logic
    ctx.isTrending = MathAbs(ctx.midSlope) > g_kRegimeCfg.flatThreshold;
    ctx.isExpanding = ctx.widthDeltaAtr > g_kRegimeCfg.widthThreshold;
@@ -190,6 +195,7 @@ bool KRegimeUpdateSymbol(const string symbol)
    else if(ctx.isTrending && ctx.isExpanding)
       ctx.state = (ctx.midSlope > 0) ? KREGIME_EXPANDING_UP : KREGIME_EXPANDING_DOWN;
 
+   ctx.prevState = priorState;
    ctx.lastBarTime = tBar;
    ctx.initialized = true;
    ctx.valid = true;
@@ -227,6 +233,55 @@ bool KRegimeGetSnapshot(const string symbol, ENUM_KREGIME_STATE &stateOut, doubl
    widthDeltaOut = g_kRegimeCtx[idx].widthDeltaAtr;
    validOut = g_kRegimeCtx[idx].valid;
    return true;
+  }
+
+bool KRegimeGetTransitionSnapshot(const string symbol,
+                                  ENUM_KREGIME_STATE &prevStateOut,
+                                  ENUM_KREGIME_STATE &stateOut,
+                                  double &midSlopeOut,
+                                  double &widthDeltaOut,
+                                  bool &validOut)
+  {
+   int idx = KRegimeFindContext(symbol);
+   if(idx < 0) return false;
+
+   prevStateOut = g_kRegimeCtx[idx].prevState;
+   stateOut = g_kRegimeCtx[idx].state;
+   midSlopeOut = g_kRegimeCtx[idx].midSlope;
+   widthDeltaOut = g_kRegimeCtx[idx].widthDeltaAtr;
+   validOut = g_kRegimeCtx[idx].valid;
+   return true;
+  }
+
+bool KRegimeIsRangeState(const ENUM_KREGIME_STATE st)
+  {
+   return (st == KREGIME_CALM_RANGE ||
+           st == KREGIME_DIRECTIONAL_UP ||
+           st == KREGIME_DIRECTIONAL_DOWN);
+  }
+
+bool KRegimeIsTrendState(const ENUM_KREGIME_STATE st)
+  {
+   return (st == KREGIME_CONTAINED_UP ||
+           st == KREGIME_CONTAINED_DOWN ||
+           st == KREGIME_EXPANDING_UP ||
+           st == KREGIME_EXPANDING_DOWN);
+  }
+
+bool KRegimeIsRangeToTrendTransition(const ENUM_KREGIME_STATE prev, const ENUM_KREGIME_STATE cur)
+  {
+   return KRegimeIsRangeState(prev) && KRegimeIsTrendState(cur);
+  }
+
+bool KRegimeIsTrendToRangeTransition(const ENUM_KREGIME_STATE prev, const ENUM_KREGIME_STATE cur)
+  {
+   return KRegimeIsTrendState(prev) && KRegimeIsRangeState(cur);
+  }
+
+bool KRegimeIsEscalationTransition(const ENUM_KREGIME_STATE prev, const ENUM_KREGIME_STATE cur)
+  {
+   return ((prev == KREGIME_CONTAINED_UP && cur == KREGIME_EXPANDING_UP) ||
+           (prev == KREGIME_CONTAINED_DOWN && cur == KREGIME_EXPANDING_DOWN));
   }
 
 string KRegimeStateName(const ENUM_KREGIME_STATE state)

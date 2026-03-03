@@ -60,6 +60,7 @@ enum enumRegimeBlockMode
 enum ENUM_DECISION_MODE { decisionLegacyParity=0, decisionRankedDeterministic=1 };
 enum ENUM_STRATEGY_TIEBREAK { stratTrendFirst=0, stratMrFirst=1 };
 enum ENUM_SIDE_TIEBREAK { sideBuyFirst=0, sideSellFirst=1 };
+enum enumRegimeRescueMode { rescueGraduated=0, rescueBlockStressed=1, rescuePreferOpposite=2 };
 
 //+------------------------------------------------------------------+
 //|  CONSTANTS                                                       |
@@ -97,10 +98,14 @@ struct ActivePair
    int               sellSeqIdx;
    datetime          lastBuySeqCloseTime;
    datetime          lastSellSeqCloseTime;
-   datetime          trendBreachTimeBuy;
-   datetime          trendBreachTimeSell;
-   double            trendBreachPriceBuy;
-   double            trendBreachPriceSell;
+   datetime          trendBreachTimeBuyA;
+   datetime          trendBreachTimeBuyB;
+   datetime          trendBreachTimeSellA;
+   datetime          trendBreachTimeSellB;
+   double            trendBreachPriceBuyA;
+   double            trendBreachPriceBuyB;
+   double            trendBreachPriceSellA;
+   double            trendBreachPriceSellB;
   };
 
 struct CorrPair
@@ -247,6 +252,14 @@ input double  KRegime_AtrMult = 2.0;                // ATR Multiplier (Bands)
 input int     KRegime_SlopeLookback = 3;            // Slope/Width Lookback (Bars)
 input double  KRegime_FlatThresholdAtr = 0.20;      // Trend Threshold (ATR %)
 input double  KRegime_WidthThresholdAtr = 0.10;     // Width Expansion Threshold (ATR %)
+
+input group "#### Regime-Led Cross-Strategy Rescue ####";
+input bool    EnableRegimeRescue = false;            // Enable regime-led cross-strategy rescue routing
+input enumRegimeRescueMode RegimeRescueMode = rescueGraduated; // Rescue policy mode
+input double  RegimeRescue_StressedGridMult = 2.0;  // Grid multiplier applied to stressed strategy
+input double  RegimeRescue_StressedLotMult = 0.25;  // Lot multiplier applied to stressed strategy
+input bool    RegimeRescue_BlockStressedStarts = true; // Block new starts on stressed strategy while rescue active
+input int     RegimeRescue_CooldownBars = 2;         // Bars to keep rescue policy after transition
 
 input group "#### LP-vs-Murrey Filter ####";
 input enumTf  LP_MM_Timeframe = tfH4;                 // LP Filter: Murrey Timeframe
@@ -534,6 +547,29 @@ bool     showEvents = true;
 CMeanReversionStrategy g_mrStrategy;
 CTrendStrategy g_trendStrategy;
 
+struct RegimeRescuePolicy
+  {
+   bool              active;
+   ENUM_STRATEGY_TYPE stressedStrategy;
+   bool              allowMrStarts;
+   bool              allowTrendStarts;
+   bool              allowMrAdds;
+   bool              allowTrendAdds;
+   double            mrGridMultiplier;
+   double            trendGridMultiplier;
+   double            mrLotMultiplier;
+   double            trendLotMultiplier;
+   bool              tieBreakOverride;
+   ENUM_STRATEGY_TIEBREAK tieBreakOverrideValue;
+   ENUM_KREGIME_STATE dominantState;
+   string            reason;
+  };
+
+RegimeRescuePolicy g_regimeRescuePolicy = {false, STRAT_MEAN_REVERSION, true, true, true, true, 1.0, 1.0, 1.0, 1.0, false, stratTrendFirst, KREGIME_NA, ""};
+int      g_regimeRescueCooldownBarsLeft = 0;
+bool     g_regimeRescueWasActive = false;
+ENUM_STRATEGY_TYPE g_regimeRescueLastStressed = STRAT_MEAN_REVERSION;
+
 // Murrey memoization cache (per symbol/timeframe/lookback/bar)
 string   murreyCacheSymbol[];
 ENUM_TIMEFRAMES murreyCacheTf[];
@@ -697,12 +733,22 @@ void GetStrategyLotConfig(const ENUM_STRATEGY_TYPE strat, double &baseLotOut, do
       multOut = TrendLotMultiplier;
       maxLotsOut = TrendMaxLots;
       riskPctOut = TrendRiskPercent;
+      if(g_regimeRescuePolicy.active)
+        {
+         baseLotOut *= g_regimeRescuePolicy.trendLotMultiplier;
+         multOut *= g_regimeRescuePolicy.trendLotMultiplier;
+        }
       return;
      }
    baseLotOut = MrLotSize;
    multOut = MrLotMultiplier;
    maxLotsOut = MrMaxLots;
    riskPctOut = MrRiskPercent;
+   if(g_regimeRescuePolicy.active)
+     {
+      baseLotOut *= g_regimeRescuePolicy.mrLotMultiplier;
+      multOut *= g_regimeRescuePolicy.mrLotMultiplier;
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1722,6 +1768,226 @@ void GetRegimeDashboardState(const string symbol, string &stateOut, string &slop
    slopeOut = DoubleToString(midSlope, 2);
   }
 
+void ResetRegimeRescuePolicy(RegimeRescuePolicy &policy)
+  {
+   policy.active = false;
+   policy.stressedStrategy = STRAT_MEAN_REVERSION;
+   policy.allowMrStarts = true;
+   policy.allowTrendStarts = true;
+   policy.allowMrAdds = true;
+   policy.allowTrendAdds = true;
+   policy.mrGridMultiplier = 1.0;
+   policy.trendGridMultiplier = 1.0;
+   policy.mrLotMultiplier = 1.0;
+   policy.trendLotMultiplier = 1.0;
+   policy.tieBreakOverride = false;
+   policy.tieBreakOverrideValue = stratTrendFirst;
+   policy.dominantState = KREGIME_NA;
+   policy.reason = "disabled";
+  }
+
+void AggregateStrategyExposure(double &mrPlOut, double &trendPlOut, int &mrTradesOut, int &trendTradesOut)
+  {
+   mrPlOut = 0.0;
+   trendPlOut = 0.0;
+   mrTradesOut = 0;
+   trendTradesOut = 0;
+   for(int i = 0; i < MAX_PAIRS * 2; i++)
+     {
+      if(g_seqMgr.m_sequences[i].tradeCount <= 0)
+         continue;
+      if(g_seqMgr.m_sequences[i].strategyType == STRAT_TRENDING)
+        {
+         trendPlOut += g_seqMgr.m_sequences[i].plOpen;
+         trendTradesOut += g_seqMgr.m_sequences[i].tradeCount;
+        }
+      else
+        {
+         mrPlOut += g_seqMgr.m_sequences[i].plOpen;
+         mrTradesOut += g_seqMgr.m_sequences[i].tradeCount;
+        }
+     }
+  }
+
+bool EvaluateRegimeRescuePolicy(RegimeRescuePolicy &policyOut, const bool decrementCooldown)
+  {
+   ResetRegimeRescuePolicy(policyOut);
+   if(!EnableRegimeRescue || numActivePairs <= 0)
+     {
+      if(g_regimeRescueWasActive && EnableLogging)
+         Print("[RegimeRescue] release");
+      g_regimeRescueWasActive = false;
+      return false;
+     }
+
+   if(decrementCooldown && g_regimeRescueCooldownBarsLeft > 0)
+      g_regimeRescueCooldownBarsLeft--;
+
+   string seenSymbols[];
+   int rangeCount = 0;
+   int trendCount = 0;
+   int r2tCount = 0;
+   int t2rCount = 0;
+   int escalationCount = 0;
+   ENUM_KREGIME_STATE dominant = KREGIME_NA;
+   int dominantScore = -1;
+
+   for(int p = 0; p < numActivePairs; p++)
+     {
+      for(int si = 0; si < 2; si++)
+        {
+         string sym = (si == 0 ? activePairs[p].symbolA : activePairs[p].symbolB);
+         if(StringLen(sym) == 0)
+            continue;
+         bool alreadySeen = false;
+         for(int j = 0; j < ArraySize(seenSymbols); j++)
+           {
+            if(seenSymbols[j] == sym)
+              {
+               alreadySeen = true;
+               break;
+              }
+           }
+         if(alreadySeen)
+            continue;
+         int ns = ArraySize(seenSymbols);
+         ArrayResize(seenSymbols, ns + 1);
+         seenSymbols[ns] = sym;
+
+         KRegimeUpdateSymbol(sym);
+         ENUM_KREGIME_STATE prevSt = KREGIME_NA, curSt = KREGIME_NA;
+         double slope = 0.0, width = 0.0;
+         bool valid = false;
+         if(!KRegimeGetTransitionSnapshot(sym, prevSt, curSt, slope, width, valid) || !valid)
+            continue;
+
+         if(KRegimeIsRangeState(curSt))
+            rangeCount++;
+         if(KRegimeIsTrendState(curSt))
+            trendCount++;
+         if(KRegimeIsRangeToTrendTransition(prevSt, curSt))
+            r2tCount++;
+         if(KRegimeIsTrendToRangeTransition(prevSt, curSt))
+            t2rCount++;
+         if(KRegimeIsEscalationTransition(prevSt, curSt))
+            escalationCount++;
+
+         int score = 0;
+         if(curSt == KREGIME_DIRECTIONAL_UP || curSt == KREGIME_DIRECTIONAL_DOWN)
+            score = 1;
+         else if(curSt == KREGIME_CONTAINED_UP || curSt == KREGIME_CONTAINED_DOWN)
+            score = 2;
+         else if(curSt == KREGIME_EXPANDING_UP || curSt == KREGIME_EXPANDING_DOWN)
+            score = 3;
+         if(score > dominantScore)
+           {
+            dominantScore = score;
+            dominant = curSt;
+           }
+        }
+     }
+
+   ENUM_STRATEGY_TYPE stressed = STRAT_MEAN_REVERSION;
+   bool hasSignal = false;
+   string reason = "";
+   if(r2tCount > 0 || escalationCount > 0)
+     {
+      stressed = STRAT_MEAN_REVERSION;
+      hasSignal = true;
+      reason = (r2tCount > 0) ? "range_to_trend" : "trend_escalation";
+     }
+   else if(t2rCount > 0)
+     {
+      stressed = STRAT_TRENDING;
+      hasSignal = true;
+      reason = "trend_to_range";
+     }
+   else if(trendCount > rangeCount)
+     {
+      stressed = STRAT_MEAN_REVERSION;
+      hasSignal = true;
+      reason = "trend_dominant";
+     }
+   else if(rangeCount > trendCount)
+     {
+      stressed = STRAT_TRENDING;
+      hasSignal = true;
+      reason = "range_dominant";
+     }
+
+   if(!hasSignal)
+     {
+      if(g_regimeRescueCooldownBarsLeft <= 0)
+        {
+         if(g_regimeRescueWasActive && EnableLogging)
+            Print("[RegimeRescue] release");
+         g_regimeRescueWasActive = false;
+         return false;
+        }
+      stressed = g_regimeRescueLastStressed;
+      reason = "cooldown_hold";
+      hasSignal = true;
+     }
+   else
+      g_regimeRescueCooldownBarsLeft = MathMax(0, RegimeRescue_CooldownBars);
+
+   double mrPl = 0.0, trendPl = 0.0;
+   int mrTrades = 0, trendTrades = 0;
+   AggregateStrategyExposure(mrPl, trendPl, mrTrades, trendTrades);
+
+   bool stressedHasExposure = ((stressed == STRAT_MEAN_REVERSION) ? (mrTrades > 0) : (trendTrades > 0));
+   if(!stressedHasExposure && RegimeRescueMode != rescuePreferOpposite && reason != "cooldown_hold")
+     {
+      if(g_regimeRescueWasActive && EnableLogging)
+         Print("[RegimeRescue] release");
+      g_regimeRescueWasActive = false;
+      return false;
+     }
+
+   policyOut.active = hasSignal;
+   policyOut.stressedStrategy = stressed;
+   policyOut.reason = reason;
+   policyOut.dominantState = dominant;
+   policyOut.tieBreakOverride = true;
+   policyOut.tieBreakOverrideValue = (stressed == STRAT_MEAN_REVERSION) ? stratTrendFirst : stratMrFirst;
+
+   bool blockAdds = (RegimeRescueMode == rescueBlockStressed);
+   bool blockStarts = RegimeRescue_BlockStressedStarts || blockAdds;
+
+   if(stressed == STRAT_MEAN_REVERSION)
+     {
+      policyOut.allowMrStarts = !blockStarts;
+      policyOut.allowMrAdds = !blockAdds;
+      policyOut.allowTrendStarts = true;
+      policyOut.allowTrendAdds = true;
+      policyOut.mrGridMultiplier = MathMax(1.0, RegimeRescue_StressedGridMult);
+      policyOut.mrLotMultiplier = MathMax(0.01, RegimeRescue_StressedLotMult);
+     }
+   else
+     {
+      policyOut.allowTrendStarts = !blockStarts;
+      policyOut.allowTrendAdds = !blockAdds;
+      policyOut.allowMrStarts = true;
+      policyOut.allowMrAdds = true;
+      policyOut.trendGridMultiplier = MathMax(1.0, RegimeRescue_StressedGridMult);
+      policyOut.trendLotMultiplier = MathMax(0.01, RegimeRescue_StressedLotMult);
+     }
+
+   if(policyOut.active &&
+      (!g_regimeRescueWasActive || g_regimeRescueLastStressed != policyOut.stressedStrategy) &&
+      EnableLogging)
+      Print("[RegimeRescue] trigger reason=", policyOut.reason,
+            " stressed=", (policyOut.stressedStrategy == STRAT_MEAN_REVERSION ? "MR" : "TREND"),
+            " state=", KRegimeStateName(policyOut.dominantState));
+
+   if(!policyOut.active && g_regimeRescueWasActive && EnableLogging)
+      Print("[RegimeRescue] release");
+
+   g_regimeRescueWasActive = policyOut.active;
+   g_regimeRescueLastStressed = policyOut.stressedStrategy;
+   return policyOut.active;
+  }
+
 //+------------------------------------------------------------------+
 //|  Regime Multipliers                                              |
 //+------------------------------------------------------------------+
@@ -2634,8 +2900,14 @@ void RunScanner()
          newPairs[selected].entry_mm_plus28 = 0;
          newPairs[selected].lastBuySeqCloseTime = 0;
          newPairs[selected].lastSellSeqCloseTime = 0;
-         newPairs[selected].trendBreachTimeBuy = 0;
-         newPairs[selected].trendBreachTimeSell = 0;
+         newPairs[selected].trendBreachTimeBuyA = 0;
+         newPairs[selected].trendBreachTimeBuyB = 0;
+         newPairs[selected].trendBreachTimeSellA = 0;
+         newPairs[selected].trendBreachTimeSellB = 0;
+         newPairs[selected].trendBreachPriceBuyA = 0;
+         newPairs[selected].trendBreachPriceBuyB = 0;
+         newPairs[selected].trendBreachPriceSellA = 0;
+         newPairs[selected].trendBreachPriceSellB = 0;
         }
       // Update fields that may change on rescan
       if(carried)
@@ -2738,8 +3010,14 @@ void RunScanner()
       newPairs[selected].entry_mm_plus28 = 0;
       newPairs[selected].lastBuySeqCloseTime = 0;
       newPairs[selected].lastSellSeqCloseTime = 0;
-      newPairs[selected].trendBreachTimeBuy = 0;
-      newPairs[selected].trendBreachTimeSell = 0;
+      newPairs[selected].trendBreachTimeBuyA = 0;
+      newPairs[selected].trendBreachTimeBuyB = 0;
+      newPairs[selected].trendBreachTimeSellA = 0;
+      newPairs[selected].trendBreachTimeSellB = 0;
+      newPairs[selected].trendBreachPriceBuyA = 0;
+      newPairs[selected].trendBreachPriceBuyB = 0;
+      newPairs[selected].trendBreachPriceSellA = 0;
+      newPairs[selected].trendBreachPriceSellB = 0;
       selected++;
       if(EnableLogging)
          Print("[Scanner] Recovery: added managed-only symbol ", posSymbol, " with open positions");
@@ -2766,6 +3044,8 @@ void RunScanner()
       tempSequences[i].trailSL = 0;
       tempSequences[i].lpTriggerDist = 0;
       tempSequences[i].lpTrailDist = 0;
+      tempSequences[i].trendScaleMaxNReached = 0;
+      tempSequences[i].trendScaleLastRetestNOpened = 0;
      }
 
    for(int i = 0; i < selected; i++)
@@ -2787,11 +3067,29 @@ void RunScanner()
            }
         }
 
+      long detectedBuyMagic = 0, detectedSellMagic = 0;
+      bool buyFound = TryDetectUniqueOpenSeqMagicForSymbolSide(newPairs[i].symbolA, POSITION_TYPE_BUY, detectedBuyMagic);
+      bool sellFound = TryDetectUniqueOpenSeqMagicForSymbolSide(newPairs[i].symbolA, POSITION_TYPE_SELL, detectedSellMagic);
+
       if(oldBuyIdx >= 0)
         {
          // EXISTING: Preserve state and magic number
          tempSequences[newBuyIdx] = g_seqMgr.m_sequences[oldBuyIdx];
          tempSequences[newSellIdx] = g_seqMgr.m_sequences[oldSellIdx];
+         
+         // Sanity Check: If live terminal data unequivocally contradicts internal memory mapping, trust the terminal.
+         // This prevents swapped magics (arising from manual intervention or legacy bugs) from persisting.
+         if (buyFound && detectedBuyMagic > 0 && tempSequences[newBuyIdx].magicNumber != detectedBuyMagic)
+           {
+            if(EnableLogging) Print("[ScannerMap] Overriding corrupted BUY magic ", tempSequences[newBuyIdx].magicNumber, " -> ", detectedBuyMagic, " for ", newPairs[i].symbolA);
+            tempSequences[newBuyIdx].magicNumber = detectedBuyMagic;
+           }
+         if (sellFound && detectedSellMagic > 0 && tempSequences[newSellIdx].magicNumber != detectedSellMagic)
+           {
+            if(EnableLogging) Print("[ScannerMap] Overriding corrupted SELL magic ", tempSequences[newSellIdx].magicNumber, " -> ", detectedSellMagic, " for ", newPairs[i].symbolA);
+            tempSequences[newSellIdx].magicNumber = detectedSellMagic;
+           }
+
          if(EnableLogging)
            {
             Print("[ScannerMap] Carry symbol ", newPairs[i].symbolA,
@@ -3359,9 +3657,12 @@ void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double curr
       if(effTSL <= 0)
          return;
 
-      // Use passed bid/ask
-      double curBid = currentBid;
-      double curAsk = currentAsk;
+      // Use actual symbol price for this sequence (multi-currency safe)
+      MqlTick tick;
+      if(!GetCachedTick(sym, tick))
+         return;
+      double curBid = tick.bid;
+      double curAsk = tick.ask;
 
       if(side == SIDE_BUY)
         {
@@ -3370,6 +3671,7 @@ void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double curr
             if(curBid >= avgP + effLP)
               {
                 g_seqMgr.m_sequences[seqIdx].lockProfitExec = true;
+                SaveSequenceLockProfile(seqIdx, sym);
                 if(EnableLogging)
                    Print("[LockProfit] BUY activated for magic ", magic, " (pairIdx=", pairIdx, ") at price ", curBid, " avgP=", avgP, " effLP=", effLP);
               }
@@ -3402,6 +3704,7 @@ void TrailingForSequence(int seqIdx, int pairIdx, double currentBid, double curr
             if(curAsk <= avgP - effLP)
               {
                 g_seqMgr.m_sequences[seqIdx].lockProfitExec = true;
+                SaveSequenceLockProfile(seqIdx, sym);
                 if(EnableLogging)
                    Print("[LockProfit] SELL activated for magic ", magic, " (pairIdx=", pairIdx, ") at price ", curAsk, " avgP=", avgP, " effLP=", effLP);
               }
@@ -4248,11 +4551,32 @@ color ThemeBearCandle()
 //+------------------------------------------------------------------+
 bool SymbolsEqual(string a, string b)
   {
+   if(a == b) return true;
+   if(StringLen(a) == 0 || StringLen(b) == 0) return false;
    string aa = a;
    string bb = b;
    StringToUpper(aa);
    StringToUpper(bb);
-   return aa == bb;
+   if(aa == bb) return true;
+   
+   // Handle common broker suffixes (.m, .i, !, etc.) by checking if one is a substring of the other
+   int lenA = StringLen(aa);
+   int lenB = StringLen(bb);
+   if(lenA >= 6 && lenB >= 6)
+     {
+      // If base 6 matches, it's likely the same symbol with/without suffix
+      if(StringSubstr(aa, 0, 6) == StringSubstr(bb, 0, 6))
+         return true;
+     }
+   
+   // Fallback for non-standard length symbols (e.g. Gold)
+   if(lenA > 0 && lenB > 0)
+     {
+      if(StringFind(aa, bb) == 0 || StringFind(bb, aa) == 0)
+         return true;
+     }
+     
+   return false;
   }
 
 //+------------------------------------------------------------------+
@@ -4274,6 +4598,7 @@ string KeyToken(string s)
 //+------------------------------------------------------------------+
 string LpTrigKeyLegacy(long magic)  { return EAName + "_LP_TRG_" + IntegerToString((int)magic); }
 string LpTrailKeyLegacy(long magic) { return EAName + "_LP_TRL_" + IntegerToString((int)magic); }
+string LpExecKeyLegacy(long magic)  { return EAName + "_LP_EXE_" + IntegerToString((int)magic); }
 
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -4284,12 +4609,15 @@ string LpTrigKey(long magic, int side, string symbol)
           IntegerToString(side) + "_" + KeyToken(symbol);
   }
 
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
 string LpTrailKey(long magic, int side, string symbol)
   {
    return EAName + "_LP_TRL_" + IntegerToString((int)magic) + "_" +
+          IntegerToString(side) + "_" + KeyToken(symbol);
+  }
+
+string LpExecKey(long magic, int side, string symbol)
+  {
+   return EAName + "_LP_EXE_" + IntegerToString((int)magic) + "_" +
           IntegerToString(side) + "_" + KeyToken(symbol);
   }
 
@@ -4326,12 +4654,16 @@ void ClearSequenceLockProfile(int seqIdx)
      {
       GlobalVariableDel(LpTrigKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, sym));
       GlobalVariableDel(LpTrailKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, sym));
+      GlobalVariableDel(LpExecKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, sym));
      }
    // Legacy cleanup
    GlobalVariableDel(LpTrigKeyLegacy(g_seqMgr.m_sequences[seqIdx].magicNumber));
    GlobalVariableDel(LpTrailKeyLegacy(g_seqMgr.m_sequences[seqIdx].magicNumber));
+   GlobalVariableDel(LpExecKeyLegacy(g_seqMgr.m_sequences[seqIdx].magicNumber));
+   
    g_seqMgr.m_sequences[seqIdx].lpTriggerDist = 0;
    g_seqMgr.m_sequences[seqIdx].lpTrailDist = 0;
+   g_seqMgr.m_sequences[seqIdx].lockProfitExec = false;
   }
 
 //+------------------------------------------------------------------+
@@ -4344,28 +4676,39 @@ bool LoadSequenceLockProfile(int seqIdx, string symbol)
    int side = g_seqMgr.m_sequences[seqIdx].side;
    string kTrig = LpTrigKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, symbol);
    string kTrail = LpTrailKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, symbol);
+   string kExec = LpExecKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, symbol);
+   
    bool hasTrig = GlobalVariableCheck(kTrig);
    bool hasTrail = GlobalVariableCheck(kTrail);
+   bool hasExec = GlobalVariableCheck(kExec);
 
    if(hasTrig || hasTrail)
      {
       g_seqMgr.m_sequences[seqIdx].lpTriggerDist = hasTrig ? GlobalVariableGet(kTrig) : 0;
       g_seqMgr.m_sequences[seqIdx].lpTrailDist = hasTrail ? GlobalVariableGet(kTrail) : 0;
+      g_seqMgr.m_sequences[seqIdx].lockProfitExec = hasExec ? (GlobalVariableGet(kExec) > 0) : false;
       return true;
      }
 
    // Legacy fallback (older builds keyed only by magic)
    string kTrigOld = LpTrigKeyLegacy(g_seqMgr.m_sequences[seqIdx].magicNumber);
    string kTrailOld = LpTrailKeyLegacy(g_seqMgr.m_sequences[seqIdx].magicNumber);
+   string kExecOld = LpExecKeyLegacy(g_seqMgr.m_sequences[seqIdx].magicNumber);
+   
    bool hasTrigOld = GlobalVariableCheck(kTrigOld);
    bool hasTrailOld = GlobalVariableCheck(kTrailOld);
+   bool hasExecOld = GlobalVariableCheck(kExecOld);
+   
    if(!hasTrigOld && !hasTrailOld)
       return false;
    g_seqMgr.m_sequences[seqIdx].lpTriggerDist = hasTrigOld ? GlobalVariableGet(kTrigOld) : 0;
    g_seqMgr.m_sequences[seqIdx].lpTrailDist = hasTrailOld ? GlobalVariableGet(kTrailOld) : 0;
+   g_seqMgr.m_sequences[seqIdx].lockProfitExec = hasExecOld ? (GlobalVariableGet(kExecOld) > 0) : false;
+   
    // Migrate forward to symbol/side-specific keys.
    GlobalVariableSet(kTrig, g_seqMgr.m_sequences[seqIdx].lpTriggerDist);
    GlobalVariableSet(kTrail, g_seqMgr.m_sequences[seqIdx].lpTrailDist);
+   GlobalVariableSet(kExec, (double)g_seqMgr.m_sequences[seqIdx].lockProfitExec);
    return true;
   }
 
@@ -4379,6 +4722,7 @@ void SaveSequenceLockProfile(int seqIdx, string symbol)
    int side = g_seqMgr.m_sequences[seqIdx].side;
    GlobalVariableSet(LpTrigKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, symbol), g_seqMgr.m_sequences[seqIdx].lpTriggerDist);
    GlobalVariableSet(LpTrailKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, symbol), g_seqMgr.m_sequences[seqIdx].lpTrailDist);
+   GlobalVariableSet(LpExecKey(g_seqMgr.m_sequences[seqIdx].magicNumber, side, symbol), (double)g_seqMgr.m_sequences[seqIdx].lockProfitExec);
   }
 
 //+------------------------------------------------------------------+
@@ -5310,6 +5654,16 @@ void DrawDashboard()
       PanelLabel("gp_peak", "Global Pips Peak: " + DoubleToString(globalPipsHigh, 1), txtWarn);
    if(hard_stop)
       PanelLabel("stop", "!! STOPPED: " + stopReason, txtBad);
+   if(g_regimeRescuePolicy.active)
+     {
+      string rs = (g_regimeRescuePolicy.stressedStrategy == STRAT_MEAN_REVERSION) ? "MR" : "TREND";
+      string rescueRow = "RegimeRescue: ON  stressed=" + rs +
+                         "  mode=" + EnumToString(RegimeRescueMode) +
+                         "  reason=" + g_regimeRescuePolicy.reason;
+      PanelLabel("regime_rescue", rescueRow, txtWarn);
+     }
+   else
+      PanelLabel("regime_rescue", "RegimeRescue: OFF", txtMuted);
 
    int tableW = GetTableAreaWidth();
 
@@ -6305,6 +6659,22 @@ void OnTick()
         }
      }
 
+   if(g_regimeRescuePolicy.active && RescueNetProfitTarget > 0)
+     {
+      double netPlNow = TotalPlOpen();
+      if(netPlNow >= RescueNetProfitTarget)
+        {
+         ENUM_STRATEGY_TYPE stressed = g_regimeRescuePolicy.stressedStrategy;
+         CloseSequencesByStrategy(stressed, "Regime Rescue Release");
+         if(EnableLogging)
+            Print("[RegimeRescue] release net=", DoubleToString(netPlNow, 2),
+                  " stressed=", (stressed == STRAT_MEAN_REVERSION ? "MR" : "TREND"));
+         ResetRegimeRescuePolicy(g_regimeRescuePolicy);
+         g_regimeRescueCooldownBarsLeft = 0;
+         g_regimeRescueWasActive = false;
+        }
+     }
+
 // Sequence limits
    if(MaxSequencesPerDay > 0 && sequenceCounter >= MaxSequencesPerDay)
      {
@@ -6360,6 +6730,11 @@ void OnTick()
      }
 
 // Session checks
+   if(EnableRegimeRescue && AnyStrategyRegimeEnabled())
+      EvaluateRegimeRescuePolicy(g_regimeRescuePolicy, newBar);
+   else
+      ResetRegimeRescuePolicy(g_regimeRescuePolicy);
+
    mrSessionOpen = IsStrategySessionOpen(STRAT_MEAN_REVERSION);
    trendSessionOpen = IsStrategySessionOpen(STRAT_TRENDING);
    anyStrategySessionOpen = (mrSessionOpen && EnableMeanReversion) || (trendSessionOpen && EnableTrendingStrategy);
@@ -6587,6 +6962,13 @@ void OnTick()
 
          bool routeMr = EnableMeanReversion;
          bool routeTrend = EnableTrendingStrategy;
+         bool mrStartsAllowed = !g_regimeRescuePolicy.active || g_regimeRescuePolicy.allowMrStarts;
+         bool trendStartsAllowed = !g_regimeRescuePolicy.active || g_regimeRescuePolicy.allowTrendStarts;
+         bool mrAddsAllowed = !g_regimeRescuePolicy.active || g_regimeRescuePolicy.allowMrAdds;
+         bool trendAddsAllowed = !g_regimeRescuePolicy.active || g_regimeRescuePolicy.allowTrendAdds;
+         ENUM_STRATEGY_TIEBREAK effectiveTieBreak = g_regimeRescuePolicy.tieBreakOverride ?
+                                                    g_regimeRescuePolicy.tieBreakOverrideValue :
+                                                    StrategyTieBreak;
 
          // === [TREND_DIAG] LOGGING ===
          if(EnableLogging && (routeTrend || routeMr))
@@ -6624,13 +7006,13 @@ void OnTick()
             int sideVal = isBuy ? SIDE_BUY : SIDE_SELL;
             int seqIdx = isBuy ? bIdx : sIdx;
             bool startedNow = isBuy ? buyStartedNow : sellStartedNow;
-            if(!routeTrend || !trendSessionOpen || startedNow || !allowNewStarts || !CanOpenSide(sideVal) || g_seqMgr.m_sequences[seqIdx].tradeCount != 0)
+            if(!routeTrend || !trendStartsAllowed || !trendSessionOpen || startedNow || !allowNewStarts || !CanOpenSide(sideVal) || g_seqMgr.m_sequences[seqIdx].tradeCount != 0)
                continue;
             bool scarceStartSlots = ((MaxOpenSequences > 0 && openMrSequenceCount >= MaxOpenSequences - 1) ||
                                      (DecisionMode == decisionRankedDeterministic && MaxStartsPerBar > 0 && startsExecutedThisBar >= MaxStartsPerBar - 1));
             bool mrCompetes = routeMr && mrSessionOpen;
             if(DecisionMode == decisionRankedDeterministic &&
-               StrategyTieBreak == stratMrFirst &&
+               effectiveTieBreak == stratMrFirst &&
                mrCompetes &&
                scarceStartSlots)
                continue;
@@ -6657,44 +7039,58 @@ void OnTick()
             // Track Breaches (Sensitive to 15% of an increment)
             if(isBuy) {
                if(upCrossA >= levelA + 0.15 * trIncA - EPS) {
-                  activePairs[p].trendBreachTimeBuy = TimeCurrent();
-                  activePairs[p].trendBreachPriceBuy = levelA;
+                  activePairs[p].trendBreachTimeBuyA = TimeCurrent();
+                  activePairs[p].trendBreachPriceBuyA = levelA;
                }
                if(upCrossB >= levelB + 0.15 * trIncB - EPS) {
-                  activePairs[p].trendBreachTimeBuy = TimeCurrent();
-                  activePairs[p].trendBreachPriceBuy = levelB;
+                  activePairs[p].trendBreachTimeBuyB = TimeCurrent();
+                  activePairs[p].trendBreachPriceBuyB = levelB;
                }
             } else {
                if(downCrossA <= levelA - 0.15 * trIncA + EPS) {
-                  activePairs[p].trendBreachTimeSell = TimeCurrent();
-                  activePairs[p].trendBreachPriceSell = levelA;
+                  activePairs[p].trendBreachTimeSellA = TimeCurrent();
+                  activePairs[p].trendBreachPriceSellA = levelA;
                }
                if(downCrossB <= levelB - 0.15 * trIncB + EPS) {
-                  activePairs[p].trendBreachTimeSell = TimeCurrent();
-                  activePairs[p].trendBreachPriceSell = levelB;
+                  activePairs[p].trendBreachTimeSellB = TimeCurrent();
+                  activePairs[p].trendBreachPriceSellB = levelB;
                }
             }
 
              bool aTrendRetest = false;
-             datetime bTimeA = isBuy ? activePairs[p].trendBreachTimeBuy : activePairs[p].trendBreachTimeSell;
-             double bPriceA = isBuy ? activePairs[p].trendBreachPriceBuy : activePairs[p].trendBreachPriceSell;
+             bool bTrendRetest = false;
+             datetime bTimeA = isBuy ? activePairs[p].trendBreachTimeBuyA : activePairs[p].trendBreachTimeSellA;
+             double bPriceA = isBuy ? activePairs[p].trendBreachPriceBuyA : activePairs[p].trendBreachPriceSellA;
              if(bTimeA > 0) {
                 int bBarsA = iBarShift(symA, PERIOD_CURRENT, bTimeA);
                 if(bBarsA >= 0 && bBarsA <= Trend_RetestWindow_Bars) {
                    if(isBuy) aTrendRetest = (downCrossA <= bPriceA + EPS && upCrossA >= bPriceA - EPS);
                    else aTrendRetest = (upCrossA >= bPriceA - EPS && downCrossA <= bPriceA + EPS);
                 } else {
-                   if(isBuy) { activePairs[p].trendBreachTimeBuy = 0; activePairs[p].trendBreachPriceBuy = 0; }
-                   else { activePairs[p].trendBreachTimeSell = 0; activePairs[p].trendBreachPriceSell = 0; }
+                   if(isBuy) { activePairs[p].trendBreachTimeBuyA = 0; activePairs[p].trendBreachPriceBuyA = 0; }
+                   else { activePairs[p].trendBreachTimeSellA = 0; activePairs[p].trendBreachPriceSellA = 0; }
                 }
              }
-            bool bTrendRetest = aTrendRetest; // For solo mode, B follows A logic or uses same breach state
+             datetime bTimeB = isBuy ? activePairs[p].trendBreachTimeBuyB : activePairs[p].trendBreachTimeSellB;
+             double bPriceB = isBuy ? activePairs[p].trendBreachPriceBuyB : activePairs[p].trendBreachPriceSellB;
+             if(bTimeB > 0) {
+                int bBarsB = iBarShift(symB, PERIOD_CURRENT, bTimeB);
+                if(bBarsB >= 0 && bBarsB <= Trend_RetestWindow_Bars) {
+                   if(isBuy) bTrendRetest = (downCrossB <= bPriceB + EPS && upCrossB >= bPriceB - EPS);
+                   else bTrendRetest = (upCrossB >= bPriceB - EPS && downCrossB <= bPriceB + EPS);
+                } else {
+                   if(isBuy) { activePairs[p].trendBreachTimeBuyB = 0; activePairs[p].trendBreachPriceBuyB = 0; }
+                   else { activePairs[p].trendBreachTimeSellB = 0; activePairs[p].trendBreachPriceSellB = 0; }
+                }
+             }
             double trendBlockThrA = ResolveMinIncrementForStrategy(TrendMinIncrementBlock_Pips, symA, STRAT_TRENDING);
             double trendBlockThrB = ResolveMinIncrementForStrategy(TrendMinIncrementBlock_Pips, symB, STRAT_TRENDING);
             bool aOk = ((TrendEntryType == trendEntryBreak) ? aTrendBreak : aTrendRetest) &&
+                       trIncA > EPS &&
                        (trendBlockThrA <= 0 || trIncA >= trendBlockThrA - EPS) &&
                        (MaxSpreadPips <= 0 || spreadA <= maxSpreadPtsA);
             bool bOk = ((TrendEntryType == trendEntryBreak) ? bTrendBreak : bTrendRetest) &&
+                       trIncB > EPS &&
                        (trendBlockThrB <= 0 || trIncB >= trendBlockThrB - EPS) &&
                        (MaxSpreadPips <= 0 || spreadB <= maxSpreadPtsB);
 
@@ -6773,12 +7169,28 @@ void OnTick()
                   {
                    if(isBuy) {
                       buyStartedNow = true;
-                      activePairs[p].trendBreachTimeBuy = 0;
-                      activePairs[p].trendBreachPriceBuy = 0;
+                      if(trendSym == symA || trendSym == symB) {
+                         if(trendSym == symA || symA == symB) {
+                            activePairs[p].trendBreachTimeBuyA = 0;
+                            activePairs[p].trendBreachPriceBuyA = 0;
+                         }
+                         if(trendSym == symB || symA == symB) {
+                            activePairs[p].trendBreachTimeBuyB = 0;
+                            activePairs[p].trendBreachPriceBuyB = 0;
+                         }
+                      }
                    } else {
                       sellStartedNow = true;
-                      activePairs[p].trendBreachTimeSell = 0;
-                      activePairs[p].trendBreachPriceSell = 0;
+                      if(trendSym == symA || trendSym == symB) {
+                         if(trendSym == symA || symA == symB) {
+                            activePairs[p].trendBreachTimeSellA = 0;
+                            activePairs[p].trendBreachPriceSellA = 0;
+                         }
+                         if(trendSym == symB || symA == symB) {
+                            activePairs[p].trendBreachTimeSellB = 0;
+                            activePairs[p].trendBreachPriceSellB = 0;
+                         }
+                      }
                    }
                   if(MaxOpenSequences > 0)
                      openMrSequenceCount++;
@@ -6796,12 +7208,12 @@ void OnTick()
             int sideVal = isBuy ? SIDE_BUY : SIDE_SELL;
             int seqIdx = isBuy ? bIdx : sIdx;
             bool startedNow = isBuy ? buyStartedNow : sellStartedNow;
-            if(!routeMr || !mrSessionOpen || startedNow || !allowNewStarts || !CanOpenSide(sideVal) || g_seqMgr.m_sequences[seqIdx].tradeCount != 0)
+            if(!routeMr || !mrStartsAllowed || !mrSessionOpen || startedNow || !allowNewStarts || !CanOpenSide(sideVal) || g_seqMgr.m_sequences[seqIdx].tradeCount != 0)
                continue;
             bool scarceStartSlots = ((MaxOpenSequences > 0 && openMrSequenceCount >= MaxOpenSequences - 1) ||
                                      (DecisionMode == decisionRankedDeterministic && MaxStartsPerBar > 0 && startsExecutedThisBar >= MaxStartsPerBar - 1));
             if(DecisionMode == decisionRankedDeterministic &&
-               StrategyTieBreak == stratTrendFirst &&
+               effectiveTieBreak == stratTrendFirst &&
                routeTrend && trendSessionOpen &&
                scarceStartSlots)
                continue;
@@ -7024,10 +7436,14 @@ void OnTick()
                g_seqMgr.m_sequences[seqIdx].tradeCount <= 0 ||
                g_seqMgr.m_sequences[seqIdx].tradeCount >= MaxOrders)
                continue;
+            if(!trendAddsAllowed)
+               continue;
             if(!trendSessionOpen && GetStrategySessionEndAction(STRAT_TRENDING) == SESSION_END_PAUSE)
                continue;
+            if(g_seqMgr.m_sequences[seqIdx].lockProfitExec)
+               continue;
             if(DecisionMode == decisionRankedDeterministic &&
-               StrategyTieBreak == stratMrFirst &&
+               effectiveTieBreak == stratMrFirst &&
                MaxAddsPerBar > 0 && addsExecutedThisBar >= MaxAddsPerBar - 1)
                continue;
             if(DecisionMode == decisionRankedDeterministic && MaxAddsPerBar > 0 && addsExecutedThisBar >= MaxAddsPerBar)
@@ -7055,6 +7471,7 @@ void OnTick()
 
             double trendInc = g_seqMgr.m_sequences[seqIdx].entryMmIncrement > EPS ? g_seqMgr.m_sequences[seqIdx].entryMmIncrement :
                               (activeSym == symB ? trIncB : trIncA);
+            trendInc *= g_regimeRescuePolicy.trendGridMultiplier;
             double trendExpandThr = ResolveMinIncrementForStrategy(TrendMinIncrementExpand_Pips, activeSym, STRAT_TRENDING);
             if(trendExpandThr > 0 && trendInc < trendExpandThr)
                trendInc = trendExpandThr;
@@ -7082,8 +7499,22 @@ void OnTick()
                                      : (g_seqMgr.m_sequences[seqIdx].lowestPrice <= requiredBound);
                bool retestHit = isBuy ? (execPrice <= retestLevel)
                                       : (execPrice >= retestLevel);
-               if(boundMet && retestHit)
+               if(boundMet && g_seqMgr.m_sequences[seqIdx].trendScaleMaxNReached < n)
                  {
+                  g_seqMgr.m_sequences[seqIdx].trendScaleMaxNReached = n;
+                  if(EnableLogging)
+                     Print("[TrendScale] ", (isBuy ? "BUY" : "SELL"), " bound_reached step=", n,
+                           " ", activeSym, " bound=", DoubleToString(requiredBound, activeDigits),
+                           " extreme=", DoubleToString(isBuy ? g_seqMgr.m_sequences[seqIdx].highestPrice : g_seqMgr.m_sequences[seqIdx].lowestPrice, activeDigits));
+                 }
+               bool stepArmed = (g_seqMgr.m_sequences[seqIdx].trendScaleMaxNReached >= n);
+               bool stepNotConsumed = (g_seqMgr.m_sequences[seqIdx].trendScaleLastRetestNOpened < n);
+               if(stepArmed && stepNotConsumed && retestHit)
+                 {
+                  if(EnableLogging)
+                     Print("[TrendScale] ", (isBuy ? "BUY" : "SELL"), " retest_hit step=", n,
+                           " ", activeSym, " retest=", DoubleToString(retestLevel, activeDigits),
+                           " exec=", DoubleToString(execPrice, activeDigits));
                   addTriggered = true;
                   addModeTag = "TrendScale";
                   logRetestLevel = retestLevel;
@@ -7118,6 +7549,15 @@ void OnTick()
                      " exec=", DoubleToString(execPrice, activeDigits),
                      " retest=", DoubleToString(logRetestLevel, activeDigits));
             bool openedTrendAdd = OpenOrderWithContext(seqIdx, isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, activeSym, STRAT_TRENDING);
+            if(openedTrendAdd && addModeTag == "TrendScale")
+              {
+               if(g_seqMgr.m_sequences[seqIdx].trendScaleMaxNReached < n)
+                  g_seqMgr.m_sequences[seqIdx].trendScaleMaxNReached = n;
+               g_seqMgr.m_sequences[seqIdx].trendScaleLastRetestNOpened = n;
+               if(EnableLogging)
+                  Print("[TrendScale] ", (isBuy ? "BUY" : "SELL"), " opened step=", n,
+                        " next_add=", n + 1, " ", activeSym);
+              }
             if(openedTrendAdd && DecisionMode == decisionRankedDeterministic)
                addsExecutedThisBar++;
            }
@@ -7132,10 +7572,14 @@ void OnTick()
                g_seqMgr.m_sequences[seqIdx].tradeCount <= 0 ||
                g_seqMgr.m_sequences[seqIdx].tradeCount >= MaxOrders)
                continue;
+            if(!mrAddsAllowed)
+               continue;
             if(!mrSessionOpen && GetStrategySessionEndAction(STRAT_MEAN_REVERSION) == SESSION_END_PAUSE)
                continue;
+            if(g_seqMgr.m_sequences[seqIdx].lockProfitExec)
+               continue;
             if(DecisionMode == decisionRankedDeterministic &&
-               StrategyTieBreak == stratTrendFirst &&
+               effectiveTieBreak == stratTrendFirst &&
                MaxAddsPerBar > 0 && addsExecutedThisBar >= MaxAddsPerBar - 1)
                continue;
             if(DecisionMode == decisionRankedDeterministic && MaxAddsPerBar > 0 && addsExecutedThisBar >= MaxAddsPerBar)
@@ -7179,6 +7623,7 @@ void OnTick()
             
             // Apply Dynamic Grid Scaling based on Regime
             frozenInc *= KRegimeGetGridMultiplier(activeSym);
+            frozenInc *= g_regimeRescuePolicy.mrGridMultiplier;
 
             double blockThr = ResolveMinIncrementForStrategy(MrMinIncrementBlock_Pips, activeSym, STRAT_MEAN_REVERSION);
             if(blockThr > 0 && frozenInc < blockThr)

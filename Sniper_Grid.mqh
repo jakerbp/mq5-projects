@@ -156,19 +156,31 @@ bool GetWorstEntryByMagic(long magic, string symbol, int side, double &worstEntr
   {
    bool found = false;
    worstEntry = 0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
      {
-      if(PositionGetTicket(i) == 0)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0)
          continue;
-      if(PositionGetInteger(POSITION_MAGIC) != magic)
+      
+      long pMagic = PositionGetInteger(POSITION_MAGIC);
+      if(pMagic != magic)
          continue;
-      if(!SymbolsEqual(PositionGetString(POSITION_SYMBOL), symbol)) // Requires SymbolsEqual
-         continue;
+         
+      string posSym = PositionGetString(POSITION_SYMBOL);
+      bool symOk = SymbolsEqual(posSym, symbol);
+      
       long pType = PositionGetInteger(POSITION_TYPE);
-      if(side == SIDE_BUY && pType != POSITION_TYPE_BUY)
+      bool sideOk = (side == SIDE_BUY && pType == POSITION_TYPE_BUY) || (side == SIDE_SELL && pType == POSITION_TYPE_SELL);
+
+      if(!symOk || !sideOk)
+      {
+         if(EnableLogging)
+            Print("[DIAG_GET_WORST] Potential match for magic=", magic, " failed filters: ticket=", ticket, " posSym='", posSym, "' targetSym='", symbol, "' pType=", pType, " targetSide=", side, " symOk=", (symOk?"Y":"N"), " sideOk=", (sideOk?"Y":"N"));
          continue;
-      if(side == SIDE_SELL && pType != POSITION_TYPE_SELL)
-         continue;
+      }
+      
       double pOpen = PositionGetDouble(POSITION_PRICE_OPEN);
       if(!found)
         {
@@ -196,8 +208,7 @@ int CountPositionsByMagicSide(long magic, string symbol, int side)
       if(PositionGetInteger(POSITION_MAGIC) != magic)
          continue;
       if(!SymbolsEqual(PositionGetString(POSITION_SYMBOL), symbol))
-         cnt++; // Wait, this logic was slightly simplified in the edit, restored it
-      else 
+         continue;
         {
          long pType = PositionGetInteger(POSITION_TYPE);
          if(side == SIDE_BUY && pType == POSITION_TYPE_BUY)
@@ -330,6 +341,11 @@ bool OpenOrderWithLots(int seqIdx, ENUM_ORDER_TYPE orderType, string symbol, dou
      {
       sequences[seqIdx].strategyType = stratType;
       if(isNewSeqStart) BuildAndStoreSequenceLockProfile(seqIdx, symbol); // Req: BuildAndStoreSequenceLockProfile
+      if(isNewSeqStart)
+        {
+         sequences[seqIdx].trendScaleMaxNReached = 0;
+         sequences[seqIdx].trendScaleLastRetestNOpened = 0;
+        }
       tradesOpened++;
       sequences[seqIdx].tradeCount++;
       sequences[seqIdx].totalLots += lots;

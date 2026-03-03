@@ -31,6 +31,8 @@ struct SequenceState
    double            trailSL;
    double            lpTriggerDist;
    double            lpTrailDist;
+   int               trendScaleMaxNReached;
+   int               trendScaleLastRetestNOpened;
    ulong             tickets[100];   // Performance: cached tickets for fast trailing
    int               ticketCount;
   };
@@ -68,6 +70,8 @@ public:
          m_sequences[i].trailSL = 0;
          m_sequences[i].lpTriggerDist = 0;
          m_sequences[i].lpTrailDist = 0;
+         m_sequences[i].trendScaleMaxNReached = 0;
+         m_sequences[i].trendScaleLastRetestNOpened = 0;
          m_sequences[i].ticketCount = 0;
          ArrayInitialize(m_sequences[i].tickets, 0);
         }
@@ -89,9 +93,6 @@ public:
       m_sequences[seqIdx].lowestPrice = 0;
       m_sequences[seqIdx].highestPrice = 0;
       m_sequences[seqIdx].avgPrice = 0;
-      m_sequences[seqIdx].lockProfitExec = false;
-      m_sequences[seqIdx].lpTriggerDist = 0;
-      m_sequences[seqIdx].lpTrailDist = 0;
       m_sequences[seqIdx].ticketCount = 0;
      }
 
@@ -162,6 +163,8 @@ public:
       m_sequences[seqIdx].tradeSymbol = "";
       m_sequences[seqIdx].lpTriggerDist = 0;
       m_sequences[seqIdx].lpTrailDist = 0;
+      m_sequences[seqIdx].trendScaleMaxNReached = 0;
+      m_sequences[seqIdx].trendScaleLastRetestNOpened = 0;
       m_sequences[seqIdx].ticketCount = 0;
       ArrayInitialize(m_sequences[seqIdx].tickets, 0);
      }
